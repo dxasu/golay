@@ -3,6 +3,7 @@ package designer
 import (
 	"fmt"
 	"image/color"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
@@ -36,6 +38,9 @@ type App struct {
 	formTabs      *container.AppTabs
 	dialogListBox *widget.List
 	centerPanel   *fyne.Container
+
+	// 自动保存（防抖）
+	autoSaveTimer *time.Timer
 }
 
 // NewApp 创建主应用
@@ -79,13 +84,17 @@ func (a *App) Build() {
 			a.setStatus(fmt.Sprintf("修改  %s  (%.0f,%.0f) %.0f×%.0f",
 				sel.Name, sel.X, sel.Y, sel.W, sel.H), colorEdit)
 		}
+		a.scheduleAutoSave()
 	}
 	a.dc.OnDoubleClick = func(dw *model.DesignWidget) {
 		a.openProjectInEditor(dw, defaultEventName(dw))
 	}
 
 	// ── 属性面板事件 ──────────────────────────────────────────────────────────
-	a.props.OnModified = func(_ *model.DesignWidget) { a.dc.Refresh() }
+	a.props.OnModified = func(_ *model.DesignWidget) {
+		a.dc.Refresh()
+		a.scheduleAutoSave()
+	}
 	a.props.OnFormModified = func(form *model.FormDef) {
 		// 同步 opts 以便代码生成
 		if form == a.forms[0] {
@@ -95,6 +104,7 @@ func (a *App) Build() {
 		}
 		// 更新 Tab 标题
 		a.rebuildFormTabs()
+		a.scheduleAutoSave()
 	}
 	a.props.OnOpenInEditor = func(dw *model.DesignWidget, eventName string) {
 		a.openProjectInEditor(dw, eventName)
@@ -107,6 +117,7 @@ func (a *App) Build() {
 				name := a.dc.GetSelected().Name
 				a.dc.DeleteSelected()
 				a.setStatus(fmt.Sprintf("已删除  %s", name), colorWarn)
+				a.scheduleAutoSave()
 			}
 		}
 	})
@@ -346,6 +357,23 @@ func (a *App) setStatus(msg string, dotColor color.Color) {
 	a.statusDot.Refresh()
 }
 
+// scheduleAutoSave 防抖自动保存：1.5s 内无新改动才实际写盘
+func (a *App) scheduleAutoSave() {
+	if a.project.ProjectPath == "" {
+		return // 尚未保存过工程，不自动保存
+	}
+	if a.autoSaveTimer != nil {
+		a.autoSaveTimer.Stop()
+	}
+	a.autoSaveTimer = time.AfterFunc(1500*time.Millisecond, func() {
+		if err := SaveState(a.project.ProjectPath, a.forms, a.dialogs, a.opts, a.project.ProjectPath); err == nil {
+			a.statusBar.SetText("已自动保存设计状态  ✓")
+			a.statusDot.FillColor = colorOK
+			a.statusDot.Refresh()
+		}
+	})
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 面板辅助
 // ─────────────────────────────────────────────────────────────────────────────
@@ -434,6 +462,7 @@ func (a *App) onAddWidget(t model.WidgetType) {
 	a.props.ShowWidget(dw)
 	info := model.GetWidgetTypeInfo(t)
 	a.setStatus(fmt.Sprintf("已添加  %s [%s]", dw.Name, info.DisplayName), colorOK)
+	a.scheduleAutoSave()
 }
 
 func (a *App) confirmNewProject() {
@@ -730,7 +759,7 @@ func (a *App) openProjectInEditor(dw *model.DesignWidget, eventName string) {
 		}
 	}
 
-	if err := OpenFileInEditor(eventsFile, line); err != nil {
+	if err := OpenProjectAndFile(a.project.ProjectPath, eventsFile, line); err != nil {
 		dialog.ShowError(err, a.window)
 		return
 	}
@@ -867,73 +896,175 @@ func capitalize(s string) string {
 // 最近项目
 // ─────────────────────────────────────────────────────────────────────────────
 
-// showRecentProjectsDialog 弹出最近项目选择对话框
+// showRecentProjectsDialog 弹出项目选择对话框（包含历史记录 + 自动扫描）
 func (a *App) showRecentProjectsDialog() {
-	recent := LoadRecentProjects()
+	all := a.collectAllProjects()
+	selected := -1
 
-	if len(recent) == 0 {
-		dialog.ShowInformation("打开最近项目", "暂无最近项目记录。\n请先保存一个工程。", a.window)
-		return
-	}
-
-	var selected int = -1
-
-	list := widget.NewList(
-		func() int { return len(recent) },
-		func() fyne.CanvasObject {
-			return container.NewBorder(nil, nil, nil,
-				canvas.NewText("", color.NRGBA{R: 140, G: 145, B: 170, A: 200}),
-				widget.NewLabel(""),
-			)
-		},
-		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			rp := recent[id]
-			row := obj.(*fyne.Container)
-			row.Objects[0].(*widget.Label).SetText(
-				fmt.Sprintf("%s  —  %s", rp.Name, rp.Title))
-			row.Objects[1].(*canvas.Text).Text =
-				rp.SavedAt.Format("2006-01-02 15:04")
-			row.Refresh()
-		},
-	)
-	list.OnSelected = func(id widget.ListItemID) {
-		selected = int(id)
-	}
-
-	// 双击直接打开
-	list.OnSelected = func(id widget.ListItemID) {
-		selected = int(id)
-	}
-
+	// 底部路径提示
 	pathLabel := widget.NewLabel("")
 	pathLabel.TextStyle = fyne.TextStyle{Monospace: true}
-	pathLabel.Wrapping = fyne.TextWrapBreak
 
-	updatePath := func(id int) {
-		if id >= 0 && id < len(recent) {
-			pathLabel.SetText(recent[id].StatePath)
+	// 浏览按钮
+	browseBtn := widget.NewButtonWithIcon("浏览 .golay 文件…", theme.FolderOpenIcon(), func() {
+		fd := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
+			if err != nil || reader == nil {
+				return
+			}
+			defer reader.Close()
+			a.loadStateFromPath(reader.URI().Path())
+		}, a.window)
+		fd.SetFilter(storage.NewExtensionFileFilter([]string{".golay"}))
+		fd.Show()
+	})
+
+	var content fyne.CanvasObject
+
+	if len(all) == 0 {
+		hint := canvas.NewText("未在 project/ 目录下找到任何工程", color.NRGBA{R: 160, G: 165, B: 185, A: 255})
+		hint.TextSize = 13
+		hint.Alignment = fyne.TextAlignCenter
+		hint2 := canvas.NewText("请先保存一次工程，或点击下方按钮手动选择", color.NRGBA{R: 130, G: 135, B: 160, A: 200})
+		hint2.TextSize = 11
+		hint2.Alignment = fyne.TextAlignCenter
+		content = container.NewBorder(
+			nil,
+			container.NewVBox(widget.NewSeparator(), container.NewCenter(browseBtn)),
+			nil, nil,
+			container.NewCenter(container.NewVBox(hint, hint2)),
+		)
+	} else {
+		list := widget.NewList(
+			func() int { return len(all) },
+			func() fyne.CanvasObject {
+				nameLabel := widget.NewLabel("")
+				timeText := canvas.NewText("", color.NRGBA{R: 130, G: 140, B: 170, A: 220})
+				timeText.TextSize = 11
+				return container.NewBorder(nil, nil, nil,
+					container.NewGridWrap(fyne.NewSize(96, 22), timeText),
+					nameLabel,
+				)
+			},
+			func(id widget.ListItemID, obj fyne.CanvasObject) {
+				rp := all[id]
+				row := obj.(*fyne.Container)
+				nameLabel := row.Objects[0].(*widget.Label)
+				if rp.Name == rp.Title || rp.Title == "" {
+					nameLabel.SetText(rp.Name)
+				} else {
+					nameLabel.SetText(fmt.Sprintf("%s  (%s)", rp.Name, rp.Title))
+				}
+				tText := row.Objects[1].(*fyne.Container).Objects[0].(*canvas.Text)
+				if rp.SavedAt.IsZero() {
+					tText.Text = ""
+				} else {
+					tText.Text = rp.SavedAt.Format("01/02 15:04")
+				}
+				row.Refresh()
+			},
+		)
+		list.OnSelected = func(id widget.ListItemID) {
+			selected = int(id)
+			if selected < len(all) {
+				dir := filepath.Dir(all[selected].StatePath)
+				pathLabel.SetText(dir)
+			}
 		}
-	}
-	list.OnSelected = func(id widget.ListItemID) {
-		selected = int(id)
-		updatePath(selected)
+
+		content = container.NewBorder(
+			nil,
+			container.NewVBox(
+				widget.NewSeparator(),
+				container.NewHBox(
+					widget.NewIcon(theme.FolderIcon()),
+					pathLabel,
+				),
+				container.NewHBox(browseBtn),
+			),
+			nil, nil,
+			list,
+		)
 	}
 
-	content := container.NewBorder(
-		nil,
-		container.NewVBox(widget.NewSeparator(), container.NewPadded(pathLabel)),
-		nil, nil,
-		list,
-	)
-
-	d := dialog.NewCustomConfirm("打开最近项目", "打开", "取消", content,
+	d := dialog.NewCustomConfirm("打开项目", "打开", "取消", content,
 		func(ok bool) {
-			if ok && selected >= 0 && selected < len(recent) {
-				a.openRecentProject(recent[selected])
+			if ok && selected >= 0 && selected < len(all) {
+				a.openRecentProject(all[selected])
 			}
 		}, a.window)
-	d.Resize(fyne.NewSize(520, 340))
+	d.Resize(fyne.NewSize(560, 380))
 	d.Show()
+}
+
+// collectAllProjects 合并历史记录与扫描结果（去重）
+func (a *App) collectAllProjects() []RecentProject {
+	seen := map[string]bool{}
+	var all []RecentProject
+
+	// 1. 历史记录（最优先）
+	for _, rp := range LoadRecentProjects() {
+		key := rp.StatePath
+		if !seen[key] {
+			seen[key] = true
+			all = append(all, rp)
+		}
+	}
+
+	// 2. 扫描 project 根目录的所有子目录
+	entries, err := os.ReadDir(a.project.BaseDir)
+	if err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			dir := filepath.Join(a.project.BaseDir, e.Name())
+			statePath := filepath.Join(dir, stateFileName)
+
+			// 优先用 .golay 状态文件作为 key，没有则用目录路径
+			key := statePath
+			if _, err := os.Stat(statePath); os.IsNotExist(err) {
+				key = dir
+			}
+			if seen[key] {
+				continue
+			}
+
+			// 目录需有 go.mod + main.go，才认为是 golay 工程
+			if !fileExists(filepath.Join(dir, "go.mod")) || !fileExists(filepath.Join(dir, "main.go")) {
+				continue
+			}
+
+			seen[key] = true
+			title := e.Name()
+			savedAt := time.Time{}
+
+			// 有状态文件则读取标题和修改时间
+			if info, err := os.Stat(statePath); err == nil {
+				savedAt = info.ModTime()
+				if forms, _, _, _, err := LoadState(statePath); err == nil && len(forms) > 0 {
+					title = forms[0].Title
+				}
+			} else {
+				// 旧工程，用 main.go 修改时间
+				if info, err := os.Stat(filepath.Join(dir, "main.go")); err == nil {
+					savedAt = info.ModTime()
+				}
+			}
+
+			all = append(all, RecentProject{
+				StatePath: statePath, // 即使不存在也记录路径，打开时提示
+				Name:      e.Name(),
+				Title:     title,
+				SavedAt:   savedAt,
+			})
+		}
+	}
+	return all
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // buildRecentMenuItems 构建"打开最近项目"子菜单项列表
@@ -958,17 +1089,29 @@ func (a *App) buildRecentMenuItems() []*fyne.MenuItem {
 
 // openRecentProject 打开最近项目（若当前有内容则先弹确认框）
 func (a *App) openRecentProject(rp RecentProject) {
+	// 没有 .golay 状态文件时（旧项目），直接用编辑器打开目录
+	if !fileExists(rp.StatePath) {
+		projDir := filepath.Dir(rp.StatePath)
+		if err := OpenProjectAndFile(projDir, "", 0); err != nil {
+			dialog.ShowError(err, a.window)
+			return
+		}
+		a.setStatus(fmt.Sprintf("已在编辑器中打开旧项目: %s（无设计状态文件）", rp.Name), colorOK)
+		return
+	}
+
+	doLoad := func() { a.loadStateFromPath(rp.StatePath) }
 	hasContent := len(a.forms) > 1 || (len(a.forms) == 1 && len(a.forms[0].Widgets) > 0)
 	if hasContent {
 		dialog.ShowConfirm("打开最近项目",
 			fmt.Sprintf("当前设计将被替换，确定打开\n「%s — %s」？", rp.Name, rp.Title),
 			func(ok bool) {
 				if ok {
-					a.loadStateFromPath(rp.StatePath)
+					doLoad()
 				}
 			}, a.window)
 	} else {
-		a.loadStateFromPath(rp.StatePath)
+		doLoad()
 	}
 }
 

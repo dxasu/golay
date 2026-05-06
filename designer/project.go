@@ -200,45 +200,60 @@ func FindFunctionLine(filePath, funcName string) int {
 	return 1
 }
 
-// OpenFileInEditor 用最佳可用编辑器打开文件，line>0 时尝试导航到该行
-func OpenFileInEditor(filePath string, line int) error {
-	// VS Code（支持 --goto 直接跳行）
+// OpenProjectAndFile 以项目目录为工作区打开编辑器，同时定位到 filePath:line
+// dirPath 为空时仅打开文件；filePath 为空时仅打开目录。
+func OpenProjectAndFile(dirPath, filePath string, line int) error {
 	if codePath, err := exec.LookPath("code"); err == nil {
-		var cmd *exec.Cmd
-		if line > 0 {
-			cmd = exec.Command(codePath, "--goto", fmt.Sprintf("%s:%d", filePath, line))
-		} else {
-			cmd = exec.Command(codePath, filePath)
+		var args []string
+		if dirPath != "" {
+			args = append(args, dirPath)
 		}
-		return cmd.Start()
+		if filePath != "" {
+			if line > 0 {
+				args = append(args, "--goto", fmt.Sprintf("%s:%d", filePath, line))
+			} else {
+				args = append(args, filePath)
+			}
+		}
+		if len(args) == 0 {
+			return nil
+		}
+		return exec.Command(codePath, args...).Start()
 	}
-
-	// Zed
 	if zedPath, err := exec.LookPath("zed"); err == nil {
-		return exec.Command(zedPath, filePath).Start()
-	}
-
-	// Sublime Text
-	if sublPath, err := exec.LookPath("subl"); err == nil {
-		if line > 0 {
-			return exec.Command(sublPath, fmt.Sprintf("%s:%d", filePath, line)).Start()
+		var args []string
+		if dirPath != "" {
+			args = append(args, dirPath)
 		}
-		return exec.Command(sublPath, filePath).Start()
+		if filePath != "" {
+			args = append(args, filePath)
+		}
+		return exec.Command(zedPath, args...).Start()
 	}
+	if sublPath, err := exec.LookPath("subl"); err == nil {
+		target := dirPath
+		if filePath != "" && line > 0 {
+			target = fmt.Sprintf("%s:%d", filePath, line)
+		} else if filePath != "" {
+			target = filePath
+		}
+		return exec.Command(sublPath, target).Start()
+	}
+	target := dirPath
+	if filePath != "" {
+		target = filePath
+	}
+	return openWithSystem(target)
+}
 
-	// 系统默认程序
-	return openWithSystem(filePath)
+// OpenFileInEditor 用最佳可用编辑器打开单个文件，line>0 时导航到该行
+func OpenFileInEditor(filePath string, line int) error {
+	return OpenProjectAndFile("", filePath, line)
 }
 
 // OpenDirInEditor 用最佳可用编辑器打开目录
 func OpenDirInEditor(dirPath string) error {
-	if codePath, err := exec.LookPath("code"); err == nil {
-		return exec.Command(codePath, dirPath).Start()
-	}
-	if zedPath, err := exec.LookPath("zed"); err == nil {
-		return exec.Command(zedPath, dirPath).Start()
-	}
-	return openWithSystem(dirPath)
+	return OpenProjectAndFile(dirPath, "", 0)
 }
 
 func openWithSystem(path string) error {

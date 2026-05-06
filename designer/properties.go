@@ -97,9 +97,9 @@ func (pp *PropertiesPanel) buildFormEmpty() fyne.CanvasObject {
 
 func (pp *PropertiesPanel) buildFormPanel(form *model.FormDef) fyne.CanvasObject {
 	title := pp.sectionHeader("🪟  " + form.Name + "  [窗体]")
-	tabs := container.NewAppTabs(
-		container.NewTabItem("属性", pp.buildFormPropsTab(form)),
-		container.NewTabItem("事件", pp.buildEventsTab(form.Events, func(ev model.EventBinding) {
+	pages := []fyne.CanvasObject{
+		pp.buildFormPropsTab(form),
+		pp.buildEventsTab(form.Events, func(ev model.EventBinding) {
 			if pp.OnOpenInEditor != nil {
 				pp.OnOpenInEditor(nil, ev.EventName)
 			}
@@ -110,9 +110,10 @@ func (pp *PropertiesPanel) buildFormPanel(form *model.FormDef) fyne.CanvasObject
 			}
 		}, func(i int, v string) {
 			form.Events[i].HandlerFn = v
-		})),
-	)
-	return container.NewBorder(title, nil, nil, nil, tabs)
+		}),
+	}
+	tabBar := pp.buildTabBar([]string{"属性", "事件"}, pages)
+	return container.NewBorder(title, nil, nil, nil, tabBar)
 }
 
 func (pp *PropertiesPanel) buildFormPropsTab(form *model.FormDef) fyne.CanvasObject {
@@ -165,10 +166,9 @@ func (pp *PropertiesPanel) buildFormPropsTab(form *model.FormDef) fyne.CanvasObj
 func (pp *PropertiesPanel) buildWidgetPanel(dw *model.DesignWidget) fyne.CanvasObject {
 	info := model.GetWidgetTypeInfo(dw.Type)
 	title := pp.sectionHeader(fmt.Sprintf("📦  %s  [%s]", dw.Name, info.DisplayName))
-
-	tabs := container.NewAppTabs(
-		container.NewTabItem("属性", pp.buildPropsTab(dw)),
-		container.NewTabItem("事件", pp.buildEventsTab(dw.Events,
+	pages := []fyne.CanvasObject{
+		pp.buildPropsTab(dw),
+		pp.buildEventsTab(dw.Events,
 			func(ev model.EventBinding) {
 				if pp.OnOpenInEditor != nil {
 					pp.OnOpenInEditor(dw, ev.EventName)
@@ -181,10 +181,11 @@ func (pp *PropertiesPanel) buildWidgetPanel(dw *model.DesignWidget) fyne.CanvasO
 			func(i int, v string) {
 				dw.Events[i].HandlerFn = v
 			},
-		)),
-		container.NewTabItem("布局", pp.buildLayoutTab(dw)),
-	)
-	return container.NewBorder(title, nil, nil, nil, tabs)
+		),
+		pp.buildLayoutTab(dw),
+	}
+	tabBar := pp.buildTabBar([]string{"属性", "事件", "布局"}, pages)
+	return container.NewBorder(title, nil, nil, nil, tabBar)
 }
 
 func (pp *PropertiesPanel) buildPropsTab(dw *model.DesignWidget) fyne.CanvasObject {
@@ -260,6 +261,128 @@ func (pp *PropertiesPanel) buildLayoutTab(dw *model.DesignWidget) fyne.CanvasObj
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 自绘 Tab 栏（不受系统主题影响，颜色固定）
+// ─────────────────────────────────────────────────────────────────────────────
+
+// buildTabBar 返回带有自绘 tab 头的页面切换容器
+func (pp *PropertiesPanel) buildTabBar(labels []string, pages []fyne.CanvasObject) fyne.CanvasObject {
+	if len(labels) == 0 || len(labels) != len(pages) {
+		return container.NewStack()
+	}
+
+	// 颜色常量（固定，不跟系统主题走）
+	const (
+		tabH     = float32(28)
+		tabTextS = float32(11)
+	)
+	colBg        := color.NRGBA{R: 235, G: 237, B: 248, A: 255} // tab 栏背景
+	colSel       := color.NRGBA{R: 55, G: 80, B: 180, A: 255}   // 选中 tab 背景
+	colUnsel     := color.NRGBA{R: 0, G: 0, B: 0, A: 0}         // 未选中 transparent
+	colTextSel   := color.NRGBA{R: 255, G: 255, B: 255, A: 255} // 选中文字白
+	colTextUnsel := color.NRGBA{R: 40, G: 50, B: 110, A: 255}   // 未选文字深蓝
+	colUnderline := color.NRGBA{R: 55, G: 80, B: 180, A: 255}   // 底部指示线
+
+	currentPage := 0
+	pageHolder := container.NewStack(pages[0])
+
+	var tabObjs []*fyne.Container // 每个 tab 的容器（可 refresh）
+	var tabBgs   []*canvas.Rectangle
+	var tabTexts []*canvas.Text
+	var tabLines []*canvas.Rectangle
+
+	for i := range labels {
+		i := i
+		bg := canvas.NewRectangle(colUnsel)
+		bg.SetMinSize(fyne.NewSize(0, tabH))
+		if i == 0 {
+			bg.FillColor = colSel
+		}
+		bg.CornerRadius = 3
+
+		txt := canvas.NewText(labels[i], colTextUnsel)
+		txt.TextSize = tabTextS
+		txt.TextStyle = fyne.TextStyle{Bold: true}
+		if i == 0 {
+			txt.Color = colTextSel
+		}
+		txt.Alignment = fyne.TextAlignCenter
+
+		line := canvas.NewRectangle(colUnsel)
+		line.SetMinSize(fyne.NewSize(0, 2))
+		if i == 0 {
+			line.FillColor = colUnderline
+		}
+
+		cell := container.NewStack(bg, container.NewCenter(txt))
+
+		tabBgs = append(tabBgs, bg)
+		tabTexts = append(tabTexts, txt)
+		tabLines = append(tabLines, line)
+
+		col := container.NewBorder(nil, line, nil, nil, cell)
+		tabObjs = append(tabObjs, col)
+
+		// 点击切换
+		tap := newTappable(col, func() {
+			if currentPage == i {
+				return
+			}
+			// 还原旧 tab
+			tabBgs[currentPage].FillColor = colUnsel
+			tabTexts[currentPage].Color = colTextUnsel
+			tabTexts[currentPage].TextStyle.Bold = false
+			tabLines[currentPage].FillColor = colUnsel
+			tabObjs[currentPage].Refresh()
+
+			// 激活新 tab
+			currentPage = i
+			tabBgs[i].FillColor = colSel
+			tabTexts[i].Color = colTextSel
+			tabTexts[i].TextStyle.Bold = true
+			tabLines[i].FillColor = colUnderline
+			tabObjs[i].Refresh()
+
+			pageHolder.Objects = []fyne.CanvasObject{pages[i]}
+			pageHolder.Refresh()
+		})
+		_ = tap
+	}
+
+	// tab 行：每个 tab 等宽
+	tabRow := container.NewGridWithColumns(len(labels))
+	for _, tc := range tabObjs {
+		tabRow.Add(tc)
+	}
+	tabRowBg := canvas.NewRectangle(colBg)
+	tabRowBg.SetMinSize(fyne.NewSize(0, tabH+4))
+
+	header := container.NewStack(tabRowBg, tabRow)
+	return container.NewBorder(header, nil, nil, nil, pageHolder)
+}
+
+// tappable 包装任意 fyne.CanvasObject 使其可接收点击
+type tappable struct {
+	widget.BaseWidget
+	inner   fyne.CanvasObject
+	onTap   func()
+}
+
+func newTappable(inner fyne.CanvasObject, onTap func()) *tappable {
+	t := &tappable{inner: inner, onTap: onTap}
+	t.ExtendBaseWidget(t)
+	return t
+}
+func (t *tappable) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(t.inner)
+}
+func (t *tappable) Tapped(_ *fyne.PointEvent) {
+	if t.onTap != nil {
+		t.onTap()
+	}
+}
+func (t *tappable) TappedSecondary(_ *fyne.PointEvent) {}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 事件列表（通用，可用于 DesignWidget 和 FormDef）
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -320,28 +443,24 @@ func (pp *PropertiesPanel) buildEventsTab(
 
 // eventTableHeader 事件表格表头
 func (pp *PropertiesPanel) eventTableHeader() fyne.CanvasObject {
-	const hdrH = float32(20)
-	hBg := canvas.NewRectangle(color.NRGBA{R: 60, G: 70, B: 150, A: 255})
-	hBg.SetMinSize(fyne.NewSize(0, hdrH))
+	hBg := canvas.NewRectangle(color.NRGBA{R: 55, G: 68, B: 145, A: 255})
+	hBg.SetMinSize(fyne.NewSize(0, 20))
 
-	mkHdr := func(t string, w float32) fyne.CanvasObject {
-		txt := canvas.NewText(t, color.NRGBA{R: 230, G: 235, B: 255, A: 255})
+	mkHdr := func(t string) *canvas.Text {
+		txt := canvas.NewText(t, color.NRGBA{R: 220, G: 228, B: 255, A: 255})
 		txt.TextSize = 9
 		txt.TextStyle = fyne.TextStyle{Bold: true}
-		if w > 0 {
-			return container.NewGridWrap(fyne.NewSize(w, hdrH), txt)
-		}
 		return txt
 	}
 	row := container.NewBorder(nil, nil,
-		mkHdr("启用", 34),
-		mkHdr("函数名", 120),
-		mkHdr("事件名 / 签名", 0),
+		mkHdr("启用"),
+		nil,
+		mkHdr("事件名  /  处理函数"),
 	)
 	return container.NewStack(hBg, container.NewPadded(row))
 }
 
-// eventRow 单个事件行（紧凑，固定行高 26px）
+// eventRow 单个事件行（两行紧凑布局，避免函数名被截断）
 func (pp *PropertiesPanel) eventRow(
 	idx int,
 	ev model.EventBinding,
@@ -349,30 +468,29 @@ func (pp *PropertiesPanel) eventRow(
 	onToggle func(i int, v bool),
 	onRename func(i int, v string),
 ) fyne.CanvasObject {
-	const rowH = float32(26)
-
-	// 行背景
-	rowBg := canvas.NewRectangle(color.NRGBA{R: 248, G: 249, B: 255, A: 255})
+	// 行背景色
+	bgCol := color.NRGBA{R: 250, G: 251, B: 255, A: 255}
 	if ev.Enabled {
-		rowBg.FillColor = color.NRGBA{R: 232, G: 240, B: 255, A: 255}
+		bgCol = color.NRGBA{R: 232, G: 240, B: 255, A: 255}
 	}
-	rowBg.SetMinSize(fyne.NewSize(0, rowH))
+	rowBg := canvas.NewRectangle(bgCol)
 
-	// 左色条（启用时蓝色）
-	sideBar := canvas.NewRectangle(color.Transparent)
-	sideBar.SetMinSize(fyne.NewSize(3, rowH))
+	// 左色条
+	var sideCol color.Color = color.NRGBA{A: 0}
 	if ev.Enabled {
-		sideBar.FillColor = color.NRGBA{R: 60, G: 120, B: 240, A: 255}
+		sideCol = color.NRGBA{R: 60, G: 120, B: 240, A: 255}
 	}
+	sideBar := canvas.NewRectangle(sideCol)
+	sideBar.SetMinSize(fyne.NewSize(3, 0))
 
-	// 启用 checkbox
+	// 启用 checkbox（紧凑）
 	check := widget.NewCheck("", func(v bool) {
 		onToggle(idx, v)
 		pp.content.Refresh()
 	})
 	check.Checked = ev.Enabled
 
-	// 事件名（可双击）+ 签名内联小字
+	// 第一行：事件名（可双击）+ 签名小字
 	nameLabel := newDoubleTapLabel(ev.EventName, func() {
 		if onOpen != nil {
 			onOpen(ev)
@@ -380,27 +498,35 @@ func (pp *PropertiesPanel) eventRow(
 	})
 	nameLabel.TextStyle = fyne.TextStyle{Bold: ev.Enabled}
 
-	sigTxt := canvas.NewText("  "+kindLabelStr(ev.Kind), color.NRGBA{R: 140, G: 145, B: 175, A: 180})
+	sigTxt := canvas.NewText(kindLabelStr(ev.Kind), color.NRGBA{R: 130, G: 140, B: 175, A: 200})
 	sigTxt.TextSize = 9
 
-	nameRow := container.NewHBox(nameLabel, sigTxt)
+	topRow := container.NewBorder(nil, nil, nil,
+		container.NewGridWrap(fyne.NewSize(28, 22), check),
+		nameLabel,
+	)
 
-	// 函数名输入框
+	// 第二行：函数名输入框（撑满宽度）
 	fnEntry := widget.NewEntry()
 	fnEntry.SetText(ev.HandlerFn)
-	fnEntry.PlaceHolder = "函数名"
+	fnEntry.PlaceHolder = "处理函数名"
 	fnEntry.OnChanged = func(v string) { onRename(idx, v) }
+	fnEntry.TextStyle = fyne.TextStyle{Monospace: true}
 
-	row := container.NewBorder(nil, nil,
-		container.NewHBox(sideBar, container.NewGridWrap(fyne.NewSize(30, rowH), check)),
-		container.NewGridWrap(fyne.NewSize(120, rowH), fnEntry),
-		container.NewCenter(nameRow),
+	bottomRow := container.NewBorder(nil, nil,
+		container.NewGridWrap(fyne.NewSize(10, 14), sigTxt),
+		nil,
+		fnEntry,
 	)
+
+	inner := container.NewVBox(topRow, bottomRow)
 
 	sep := canvas.NewRectangle(color.NRGBA{R: 210, G: 215, B: 235, A: 255})
 	sep.SetMinSize(fyne.NewSize(0, 1))
 
-	return container.NewVBox(container.NewStack(rowBg, row), sep)
+	content := container.NewBorder(nil, nil, sideBar, nil, container.NewPadded(inner))
+
+	return container.NewVBox(container.NewStack(rowBg, content), sep)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
