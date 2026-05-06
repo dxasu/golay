@@ -1,0 +1,18 @@
+# 编译产物
+golay
+golay.exe
+*.test
+
+# 生成的工程目录（用户产出物，不纳入版本库）
+project/
+
+# Go 工具缓存
+vendor/
+
+# macOS
+.DS_Store
+
+# IDE
+.cursor/
+.vscode/
+*.swp
