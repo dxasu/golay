@@ -34,13 +34,12 @@ func (tb *Toolbox) CreateRenderer() fyne.WidgetRenderer {
 			continue
 		}
 		// 分类标题
-		catLabel := canvas.NewText(string(cat), color.NRGBA{R: 60, G: 80, B: 160, A: 255})
-		catLabel.TextSize = 11
+		catBg := canvas.NewRectangle(color.NRGBA{R: 210, G: 218, B: 245, A: 255})
+		catBg.SetMinSize(fyne.NewSize(0, 18))
+		catLabel := canvas.NewText(string(cat), color.NRGBA{R: 40, G: 60, B: 150, A: 255})
+		catLabel.TextSize = 9
 		catLabel.TextStyle = fyne.TextStyle{Bold: true}
-		items = append(items,
-			widget.NewSeparator(),
-			container.NewPadded(catLabel),
-		)
+		items = append(items, container.NewStack(catBg, container.NewCenter(catLabel)))
 
 		for _, info := range ws {
 			info := info
@@ -58,20 +57,23 @@ func (tb *Toolbox) makeItem(info model.WidgetTypeInfo) fyne.CanvasObject {
 	iconC := color.NRGBA{R: info.Color[0], G: info.Color[1], B: info.Color[2], A: 255}
 
 	icon := canvas.NewRectangle(iconC)
-	icon.CornerRadius = 3
-	icon.SetMinSize(fyne.NewSize(18, 18))
+	icon.CornerRadius = 2
+	icon.SetMinSize(fyne.NewSize(10, 10))
 
 	nameLabel := canvas.NewText(info.DisplayName, color.NRGBA{R: 30, G: 30, B: 50, A: 255})
-	nameLabel.TextSize = 12
+	nameLabel.TextSize = 11
 
-	engLabel := canvas.NewText(info.Name, color.NRGBA{R: 130, G: 130, B: 150, A: 200})
+	engLabel := canvas.NewText("  "+info.Name, color.NRGBA{R: 140, G: 140, B: 158, A: 200})
 	engLabel.TextSize = 9
 
-	labels := container.NewVBox(
-		container.NewPadded(nameLabel),
-		container.NewPadded(engLabel),
-	)
-	row := container.NewBorder(nil, nil, container.NewPadded(icon), nil, labels)
+	// 单行：[■] 显示名  英文名
+	iconBox := container.NewGridWrap(fyne.NewSize(20, 20), container.NewCenter(icon))
+	textRow := container.NewHBox(nameLabel, engLabel)
+	row := container.NewBorder(nil, nil, iconBox, nil, textRow)
+
+	// 固定行高 26px
+	minH := canvas.NewRectangle(color.Transparent)
+	minH.SetMinSize(fyne.NewSize(0, 26))
 
 	btn := widget.NewButton("", func() {
 		if tb.OnAddWidget != nil {
@@ -80,5 +82,5 @@ func (tb *Toolbox) makeItem(info model.WidgetTypeInfo) fyne.CanvasObject {
 	})
 	btn.Importance = widget.LowImportance
 
-	return container.NewStack(btn, container.NewPadded(row))
+	return container.NewStack(minH, btn, row)
 }

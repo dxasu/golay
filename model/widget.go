@@ -287,6 +287,13 @@ type DesignWidget struct {
 
 var globalIDCounter int
 
+// SetGlobalIDCounterMin 确保 globalIDCounter >= minVal（加载已有项目后调用，避免 ID 冲突）
+func SetGlobalIDCounterMin(minVal int) {
+	if globalIDCounter < minVal {
+		globalIDCounter = minVal
+	}
+}
+
 // NewDesignWidget 创建一个新的设计控件
 func NewDesignWidget(t WidgetType, x, y float32) *DesignWidget {
 	globalIDCounter++
@@ -348,6 +355,16 @@ func buildEvents(t WidgetType, name string) []EventBinding {
 		})
 	}
 	return result
+}
+
+// DefaultProperties 导出版本，供加载 XML 时重建属性列表
+func DefaultProperties(t WidgetType, name string) []Property {
+	return defaultProperties(t, name)
+}
+
+// DefaultWidgetEvents 导出版本，供加载 XML 时重建事件列表
+func DefaultWidgetEvents(t WidgetType, name string) []EventBinding {
+	return buildEvents(t, name)
 }
 
 // defaultProperties 按控件类型返回默认属性列表

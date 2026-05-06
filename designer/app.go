@@ -3,7 +3,9 @@ package designer
 import (
 	"fmt"
 	"image/color"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -79,7 +81,7 @@ func (a *App) Build() {
 		}
 	}
 	a.dc.OnDoubleClick = func(dw *model.DesignWidget) {
-		a.openProjectInEditor(dw, "")
+		a.openProjectInEditor(dw, defaultEventName(dw))
 	}
 
 	// ── 属性面板事件 ──────────────────────────────────────────────────────────
@@ -154,6 +156,7 @@ func (a *App) buildToolbar() fyne.CanvasObject {
 
 	row := container.NewHBox(
 		mkBtn("新建", theme.DocumentCreateIcon(), a.confirmNewProject),
+		mkBtn("打开", theme.FolderOpenIcon(), a.showRecentProjectsDialog),
 		vsep(),
 		mkBtn("保存工程", theme.DocumentSaveIcon(), a.saveAndPreview),
 		vsep(),
@@ -375,8 +378,15 @@ func (a *App) miniSectionHeader(title string) fyne.CanvasObject {
 // ─────────────────────────────────────────────────────────────────────────────
 
 func (a *App) buildMenu() *fyne.MainMenu {
+	// 最近项目子菜单
+	recentItems := a.buildRecentMenuItems()
+	recentMenuItem := fyne.NewMenuItem("打开最近项目", nil)
+	recentMenuItem.ChildMenu = fyne.NewMenu("", recentItems...)
+
 	fileMenu := fyne.NewMenu("文件",
 		fyne.NewMenuItem("新建项目", a.confirmNewProject),
+		fyne.NewMenuItemSeparator(),
+		recentMenuItem,
 		fyne.NewMenuItemSeparator(),
 		fyne.NewMenuItem("生成代码并保存", a.saveAndPreview),
 		fyne.NewMenuItemSeparator(),
@@ -584,28 +594,71 @@ func (a *App) saveAndPreview() {
 	}
 
 	a.syncOpts()
-	code := GenerateCode(a.forms, a.dialogs, a.opts)
-	filePath, err := a.project.EnsureProject(code, a.opts)
+	files := GenerateProject(a.forms, a.dialogs, a.opts)
+	mainPath, err := a.project.EnsureProject(files, a.opts)
 	if err != nil {
 		dialog.ShowError(err, a.window)
 		return
 	}
-	a.setStatus(fmt.Sprintf("已保存 → %s", filePath), colorOK)
+	a.setStatus(fmt.Sprintf("已保存 → %s", a.project.ProjectPath), colorOK)
+
+	// 保存设计状态文件并更新最近项目列表
+	_ = SaveState(a.project.ProjectPath, a.forms, a.dialogs, a.opts, a.project.ProjectPath)
+	title := "My App"
+	if len(a.forms) > 0 {
+		title = a.forms[0].Title
+	}
+	AddRecentProject(RecentProject{
+		StatePath: a.project.StateFilePath(),
+		Name:      filepath.Base(a.project.ProjectPath),
+		Title:     title,
+		SavedAt:   time.Now(),
+	})
+	a.window.SetMainMenu(a.buildMenu())
+
+	// 预览主窗体 UI 文件
+	previewName := UIFileName(a.forms[0].Name)
+	previewContent := files.UIFiles[previewName]
+
+	// 文件列表说明
+	var fileList strings.Builder
+	fileList.WriteString("main.go  (入口)\n")
+	for name := range files.UIFiles {
+		fileList.WriteString(name + "  (UI — 自动生成，勿手动修改)\n")
+	}
+	for name := range files.EventFiles {
+		fileList.WriteString(name + "  (事件 — 在此实现业务逻辑)\n")
+	}
+	if files.DialogsFile != "" {
+		fileList.WriteString("dialogs.go  (弹窗辅助函数)\n")
+	}
+	if files.HelpersFile != "" {
+		fileList.WriteString("helpers.go  (工具函数)\n")
+	}
+
+	fileListWidget := widget.NewMultiLineEntry()
+	fileListWidget.SetText(fileList.String())
+	fileListWidget.Disable()
+	fileListWidget.SetMinRowsVisible(len(files.UIFiles) + len(files.EventFiles) + 3)
 
 	codeEntry := widget.NewMultiLineEntry()
-	codeEntry.SetText(code)
+	codeEntry.SetText(previewContent)
 	codeEntry.TextStyle = fyne.TextStyle{Monospace: true}
 	codeEntry.Disable()
 
-	pathLabel := canvas.NewText("📁 "+filePath, color.NRGBA{R: 80, G: 100, B: 160, A: 255})
+	pathLabel := canvas.NewText("📁 "+a.project.ProjectPath, color.NRGBA{R: 80, G: 100, B: 160, A: 255})
 	pathLabel.TextSize = 10
 
-	openFileBtn := widget.NewButtonWithIcon("在编辑器中打开", theme.DocumentIcon(), func() {
-		if err := OpenFileInEditor(filePath, 0); err != nil {
+	openEventsBtn := widget.NewButtonWithIcon("打开事件文件", theme.DocumentIcon(), func() {
+		evPath := a.project.EventsFilePath(a.forms[0].Name)
+		if evPath == "" {
+			evPath = mainPath
+		}
+		if err := OpenFileInEditor(evPath, 0); err != nil {
 			dialog.ShowError(err, a.window)
 		}
 	})
-	openFileBtn.Importance = widget.HighImportance
+	openEventsBtn.Importance = widget.HighImportance
 
 	openDirBtn := widget.NewButtonWithIcon("打开工程目录", theme.FolderOpenIcon(), func() {
 		if err := OpenDirInEditor(a.project.ProjectPath); err != nil {
@@ -613,45 +666,71 @@ func (a *App) saveAndPreview() {
 		}
 	})
 
+	fileLabel := canvas.NewText("生成的文件：", color.NRGBA{R: 60, G: 80, B: 140, A: 255})
+	fileLabel.TextSize = 10
+	fileLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+	uiLabel := canvas.NewText("预览（"+previewName+"）：", color.NRGBA{R: 60, G: 80, B: 140, A: 255})
+	uiLabel.TextSize = 10
+	uiLabel.TextStyle = fyne.TextStyle{Bold: true}
+
 	content := container.NewBorder(
-		container.NewVBox(pathLabel, widget.NewSeparator()),
-		container.NewHBox(openFileBtn, openDirBtn),
+		container.NewVBox(
+			pathLabel,
+			widget.NewSeparator(),
+			fileLabel,
+			fileListWidget,
+			widget.NewSeparator(),
+			uiLabel,
+		),
+		container.NewHBox(openEventsBtn, openDirBtn),
 		nil, nil,
 		codeEntry,
 	)
 	d := dialog.NewCustom("生成代码预览", "关闭", content, a.window)
-	d.Resize(fyne.NewSize(800, 560))
+	d.Resize(fyne.NewSize(820, 620))
 	d.Show()
 }
 
 func (a *App) openProjectInEditor(dw *model.DesignWidget, eventName string) {
 	a.syncOpts()
-	code := GenerateCode(a.forms, a.dialogs, a.opts)
-	filePath, err := a.project.EnsureProject(code, a.opts)
-	if err != nil {
+	files := GenerateProject(a.forms, a.dialogs, a.opts)
+	if _, err := a.project.EnsureProject(files, a.opts); err != nil {
 		dialog.ShowError(err, a.window)
 		return
 	}
 
+	// 确定目标 form 和事件文件路径
+	targetForm := a.findFormForWidget(dw)
+	eventsFile := a.project.EventsFilePath(targetForm.Name)
+	if eventsFile == "" {
+		eventsFile = a.project.MainFile
+	}
+
 	line := 0
-	if dw != nil && eventName != "" {
-		for _, ev := range dw.Events {
-			if ev.EventName == eventName && ev.HandlerFn != "" {
-				line = FindFunctionLine(filePath, ev.HandlerFn)
-				break
+	if eventName != "" {
+		handlerFn := ""
+		if dw != nil {
+			for _, ev := range dw.Events {
+				if ev.EventName == eventName && ev.HandlerFn != "" {
+					handlerFn = ev.HandlerFn
+					break
+				}
+			}
+		} else {
+			for _, ev := range targetForm.Events {
+				if ev.EventName == eventName && ev.HandlerFn != "" {
+					handlerFn = ev.HandlerFn
+					break
+				}
 			}
 		}
-	} else if dw == nil && eventName != "" {
-		// Form 事件
-		for _, ev := range a.currentForm().Events {
-			if ev.EventName == eventName && ev.HandlerFn != "" {
-				line = FindFunctionLine(filePath, ev.HandlerFn)
-				break
-			}
+		if handlerFn != "" {
+			line = FindFunctionLine(eventsFile, handlerFn)
 		}
 	}
 
-	if err := OpenFileInEditor(filePath, line); err != nil {
+	if err := OpenFileInEditor(eventsFile, line); err != nil {
 		dialog.ShowError(err, a.window)
 		return
 	}
@@ -664,6 +743,21 @@ func (a *App) openProjectInEditor(dw *model.DesignWidget, eventName string) {
 	} else {
 		a.setStatus("编辑器: "+a.project.ProjectPath, colorOK)
 	}
+}
+
+// findFormForWidget 找到控件所属的 Form，若未找到返回当前 Form
+func (a *App) findFormForWidget(dw *model.DesignWidget) *model.FormDef {
+	if dw == nil {
+		return a.currentForm()
+	}
+	for _, form := range a.forms {
+		for _, w := range form.Widgets {
+			if w == dw {
+				return form
+			}
+		}
+	}
+	return a.currentForm()
 }
 
 func (a *App) syncOpts() {
@@ -767,4 +861,228 @@ func capitalize(s string) string {
 		b -= 32
 	}
 	return string(b) + s[1:]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 最近项目
+// ─────────────────────────────────────────────────────────────────────────────
+
+// showRecentProjectsDialog 弹出最近项目选择对话框
+func (a *App) showRecentProjectsDialog() {
+	recent := LoadRecentProjects()
+
+	if len(recent) == 0 {
+		dialog.ShowInformation("打开最近项目", "暂无最近项目记录。\n请先保存一个工程。", a.window)
+		return
+	}
+
+	var selected int = -1
+
+	list := widget.NewList(
+		func() int { return len(recent) },
+		func() fyne.CanvasObject {
+			return container.NewBorder(nil, nil, nil,
+				canvas.NewText("", color.NRGBA{R: 140, G: 145, B: 170, A: 200}),
+				widget.NewLabel(""),
+			)
+		},
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			rp := recent[id]
+			row := obj.(*fyne.Container)
+			row.Objects[0].(*widget.Label).SetText(
+				fmt.Sprintf("%s  —  %s", rp.Name, rp.Title))
+			row.Objects[1].(*canvas.Text).Text =
+				rp.SavedAt.Format("2006-01-02 15:04")
+			row.Refresh()
+		},
+	)
+	list.OnSelected = func(id widget.ListItemID) {
+		selected = int(id)
+	}
+
+	// 双击直接打开
+	list.OnSelected = func(id widget.ListItemID) {
+		selected = int(id)
+	}
+
+	pathLabel := widget.NewLabel("")
+	pathLabel.TextStyle = fyne.TextStyle{Monospace: true}
+	pathLabel.Wrapping = fyne.TextWrapBreak
+
+	updatePath := func(id int) {
+		if id >= 0 && id < len(recent) {
+			pathLabel.SetText(recent[id].StatePath)
+		}
+	}
+	list.OnSelected = func(id widget.ListItemID) {
+		selected = int(id)
+		updatePath(selected)
+	}
+
+	content := container.NewBorder(
+		nil,
+		container.NewVBox(widget.NewSeparator(), container.NewPadded(pathLabel)),
+		nil, nil,
+		list,
+	)
+
+	d := dialog.NewCustomConfirm("打开最近项目", "打开", "取消", content,
+		func(ok bool) {
+			if ok && selected >= 0 && selected < len(recent) {
+				a.openRecentProject(recent[selected])
+			}
+		}, a.window)
+	d.Resize(fyne.NewSize(520, 340))
+	d.Show()
+}
+
+// buildRecentMenuItems 构建"打开最近项目"子菜单项列表
+func (a *App) buildRecentMenuItems() []*fyne.MenuItem {
+	recent := LoadRecentProjects()
+	if len(recent) == 0 {
+		empty := fyne.NewMenuItem("（无最近项目）", nil)
+		empty.Disabled = true
+		return []*fyne.MenuItem{empty}
+	}
+
+	items := make([]*fyne.MenuItem, len(recent))
+	for i, rp := range recent {
+		rp := rp
+		label := fmt.Sprintf("%s  —  %s  (%s)", rp.Name, rp.Title, rp.SavedAt.Format("01/02 15:04"))
+		items[i] = fyne.NewMenuItem(label, func() {
+			a.openRecentProject(rp)
+		})
+	}
+	return items
+}
+
+// openRecentProject 打开最近项目（若当前有内容则先弹确认框）
+func (a *App) openRecentProject(rp RecentProject) {
+	hasContent := len(a.forms) > 1 || (len(a.forms) == 1 && len(a.forms[0].Widgets) > 0)
+	if hasContent {
+		dialog.ShowConfirm("打开最近项目",
+			fmt.Sprintf("当前设计将被替换，确定打开\n「%s — %s」？", rp.Name, rp.Title),
+			func(ok bool) {
+				if ok {
+					a.loadStateFromPath(rp.StatePath)
+				}
+			}, a.window)
+	} else {
+		a.loadStateFromPath(rp.StatePath)
+	}
+}
+
+// loadStateFromPath 从 .golay XML 状态文件恢复完整设计状态
+func (a *App) loadStateFromPath(statePath string) {
+	forms, dialogs, opts, projPath, err := LoadState(statePath)
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("无法读取项目状态文件：%v", err), a.window)
+		return
+	}
+	if len(forms) == 0 {
+		dialog.ShowError(fmt.Errorf("项目状态文件格式错误：无窗体数据"), a.window)
+		return
+	}
+
+	// 恢复数据
+	a.forms = forms
+	a.dialogs = dialogs
+	a.opts = opts
+	a.formIdx = 0
+
+	// 恢复项目路径
+	if projPath != "" {
+		a.project.ProjectPath = projPath
+		a.project.MainFile = filepath.Join(projPath, "main.go")
+	} else {
+		a.project = NewProjectManager()
+	}
+
+	// 更新 model ID 计数器，避免新增控件时 ID 冲突
+	maxWidgetID := 0
+	for _, form := range a.forms {
+		if form.ID > 0 {
+			model.SetFormIDCounterMin(form.ID)
+		}
+		for _, dw := range form.Widgets {
+			if dw.ID > maxWidgetID {
+				maxWidgetID = dw.ID
+			}
+		}
+	}
+	model.SetGlobalIDCounterMin(maxWidgetID)
+	maxMsgID := 0
+	for _, mb := range a.dialogs {
+		if mb.ID > maxMsgID {
+			maxMsgID = mb.ID
+		}
+	}
+	model.SetMsgBoxIDCounterMin(maxMsgID)
+
+	// 刷新 UI
+	a.dc.SetForm(a.forms[0])
+	a.props.ShowFormProps(a.forms[0])
+	a.rebuildFormTabsInner()
+	if a.dialogListBox != nil {
+		a.dialogListBox.Refresh()
+	}
+	a.window.SetMainMenu(a.buildMenu())
+
+	proj := filepath.Base(projPath)
+	if proj == "" || proj == "." {
+		proj = "（未保存）"
+	}
+	a.setStatus(fmt.Sprintf("已打开项目  %s — %s", proj, a.forms[0].Title), colorOK)
+}
+
+// defaultEventName 返回双击控件时应跳转的默认事件名（参考 WinForms 行为）
+func defaultEventName(dw *model.DesignWidget) string {
+	// 按控件类型确定首要事件
+	primary := map[model.WidgetType]string{
+		model.WidgetButton:        "Click",
+		model.WidgetTextBox:       "TextChanged",
+		model.WidgetMultiLineEntry: "TextChanged",
+		model.WidgetComboBox:      "SelectedIndexChanged",
+		model.WidgetCheckBox:      "CheckedChanged",
+		model.WidgetRadioButton:   "CheckedChanged",
+		model.WidgetSlider:        "ValueChanged",
+		model.WidgetDateTimePicker: "ValueChanged",
+		model.WidgetListBox:       "SelectedIndexChanged",
+		model.WidgetListView:      "SelectedIndexChanged",
+		model.WidgetDataGridView:  "CellClick",
+		model.WidgetTreeView:      "NodeClick",
+		model.WidgetTabControl:    "SelectedIndexChanged",
+	}
+
+	if name, ok := primary[dw.Type]; ok {
+		// 确保该事件存在，若未启用则自动启用
+		for i, ev := range dw.Events {
+			if ev.EventName == name {
+				if !dw.Events[i].Enabled {
+					dw.Events[i].Enabled = true
+				}
+				return name
+			}
+		}
+	}
+
+	// 回退：使用第一个专属事件（非通用事件），若无则用 Click
+	for i, ev := range dw.Events {
+		if !isUniversalEvent(ev.EventName) {
+			if !dw.Events[i].Enabled {
+				dw.Events[i].Enabled = true
+			}
+			return ev.EventName
+		}
+	}
+	// 最终回退：Click
+	for i, ev := range dw.Events {
+		if ev.EventName == "Click" {
+			if !dw.Events[i].Enabled {
+				dw.Events[i].Enabled = true
+			}
+			return "Click"
+		}
+	}
+	return ""
 }

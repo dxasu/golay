@@ -36,6 +36,13 @@ type FormDef struct {
 
 var formIDCounter int
 
+// SetFormIDCounterMin 确保 formIDCounter >= minVal
+func SetFormIDCounterMin(minVal int) {
+	if formIDCounter < minVal {
+		formIDCounter = minVal
+	}
+}
+
 // NewFormDef 创建一个新的窗体定义
 func NewFormDef(name, title string, w, h float32) *FormDef {
 	formIDCounter++
@@ -61,6 +68,11 @@ var FormEventDefs = []EventDef{
 	{"Resize", EventKindVoid, "窗体尺寸改变", false},
 	{"Activated", EventKindVoid, "窗体获得焦点/激活", false},
 	{"Deactivate", EventKindVoid, "窗体失去焦点", false},
+}
+
+// DefaultFormEvents 导出版本，供加载 XML 时重建窗体事件列表
+func DefaultFormEvents(name string) []EventBinding {
+	return buildFormEvents(name)
 }
 
 func buildFormEvents(name string) []EventBinding {
@@ -168,6 +180,13 @@ type MessageBoxDef struct {
 }
 
 var msgBoxIDCounter int
+
+// SetMsgBoxIDCounterMin 确保 msgBoxIDCounter >= minVal
+func SetMsgBoxIDCounterMin(minVal int) {
+	if msgBoxIDCounter < minVal {
+		msgBoxIDCounter = minVal
+	}
+}
 
 // NewMessageBoxDef 创建一个新的消息框定义
 func NewMessageBoxDef() *MessageBoxDef {

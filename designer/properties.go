@@ -34,25 +34,43 @@ func NewPropertiesPanel(dc *DesignCanvas) *PropertiesPanel {
 }
 
 func (pp *PropertiesPanel) CreateRenderer() fyne.WidgetRenderer {
-	pp.content = container.NewMax(pp.buildFormEmpty())
+	// 根据预设状态决定初始内容
+	var initial fyne.CanvasObject
+	switch {
+	case pp.current != nil:
+		initial = pp.buildWidgetPanel(pp.current)
+	case pp.currentForm != nil:
+		initial = pp.buildFormPanel(pp.currentForm)
+	default:
+		initial = pp.buildFormEmpty()
+	}
+	pp.content = container.NewMax(initial)
 	bg := canvas.NewRectangle(color.NRGBA{R: 244, G: 245, B: 252, A: 255})
 	return widget.NewSimpleRenderer(container.NewMax(bg, pp.content))
+}
+
+// setContent 安全地设置面板内容（content 可能尚未初始化）
+func (pp *PropertiesPanel) setContent(obj fyne.CanvasObject) {
+	if pp.content == nil {
+		// CreateRenderer 尚未被调用，预设状态即可，渲染时会用到
+		return
+	}
+	pp.content.Objects = []fyne.CanvasObject{obj}
+	pp.content.Refresh()
 }
 
 // ShowWidget 展示控件属性
 func (pp *PropertiesPanel) ShowWidget(dw *model.DesignWidget) {
 	pp.current = dw
 	pp.currentForm = nil
-	pp.content.Objects = []fyne.CanvasObject{pp.buildWidgetPanel(dw)}
-	pp.content.Refresh()
+	pp.setContent(pp.buildWidgetPanel(dw))
 }
 
 // ShowFormProps 展示 Form 属性（未选中控件时）
 func (pp *PropertiesPanel) ShowFormProps(form *model.FormDef) {
 	pp.currentForm = form
 	pp.current = nil
-	pp.content.Objects = []fyne.CanvasObject{pp.buildFormPanel(form)}
-	pp.content.Refresh()
+	pp.setContent(pp.buildFormPanel(form))
 }
 
 // ClearWidget 回到 Form 属性（若有当前 Form）
@@ -61,8 +79,8 @@ func (pp *PropertiesPanel) ClearWidget() {
 	if pp.dc != nil && pp.dc.GetCurrentForm() != nil {
 		pp.ShowFormProps(pp.dc.GetCurrentForm())
 	} else {
-		pp.content.Objects = []fyne.CanvasObject{pp.buildFormEmpty()}
-		pp.content.Refresh()
+		pp.currentForm = nil
+		pp.setContent(pp.buildFormEmpty())
 	}
 }
 
@@ -279,11 +297,11 @@ func (pp *PropertiesPanel) buildEventsTab(
 			return
 		}
 		secBg := canvas.NewRectangle(color.NRGBA{R: 220, G: 225, B: 245, A: 255})
-		secBg.SetMinSize(fyne.NewSize(0, 20))
+		secBg.SetMinSize(fyne.NewSize(0, 16))
 		secTxt := canvas.NewText(title, color.NRGBA{R: 50, G: 60, B: 140, A: 255})
-		secTxt.TextSize = 10
+		secTxt.TextSize = 9
 		secTxt.TextStyle = fyne.TextStyle{Bold: true}
-		rows = append(rows, container.NewStack(secBg, container.NewPadded(secTxt)))
+		rows = append(rows, container.NewStack(secBg, container.NewCenter(secTxt)))
 
 		for _, idx := range indices {
 			rows = append(rows, pp.eventRow(idx, events[idx], onOpen, onToggle, onRename))
@@ -302,27 +320,28 @@ func (pp *PropertiesPanel) buildEventsTab(
 
 // eventTableHeader 事件表格表头
 func (pp *PropertiesPanel) eventTableHeader() fyne.CanvasObject {
+	const hdrH = float32(20)
 	hBg := canvas.NewRectangle(color.NRGBA{R: 60, G: 70, B: 150, A: 255})
-	hBg.SetMinSize(fyne.NewSize(0, 24))
+	hBg.SetMinSize(fyne.NewSize(0, hdrH))
 
 	mkHdr := func(t string, w float32) fyne.CanvasObject {
 		txt := canvas.NewText(t, color.NRGBA{R: 230, G: 235, B: 255, A: 255})
-		txt.TextSize = 10
+		txt.TextSize = 9
 		txt.TextStyle = fyne.TextStyle{Bold: true}
 		if w > 0 {
-			return container.NewGridWrap(fyne.NewSize(w, 24), txt)
+			return container.NewGridWrap(fyne.NewSize(w, hdrH), txt)
 		}
 		return txt
 	}
 	row := container.NewBorder(nil, nil,
-		mkHdr("启用", 36),
+		mkHdr("启用", 34),
 		mkHdr("函数名", 120),
 		mkHdr("事件名 / 签名", 0),
 	)
 	return container.NewStack(hBg, container.NewPadded(row))
 }
 
-// eventRow 单个事件行（紧凑）
+// eventRow 单个事件行（紧凑，固定行高 26px）
 func (pp *PropertiesPanel) eventRow(
 	idx int,
 	ev model.EventBinding,
@@ -330,16 +349,18 @@ func (pp *PropertiesPanel) eventRow(
 	onToggle func(i int, v bool),
 	onRename func(i int, v string),
 ) fyne.CanvasObject {
-	// 行背景：启用时有淡蓝高亮
+	const rowH = float32(26)
+
+	// 行背景
 	rowBg := canvas.NewRectangle(color.NRGBA{R: 248, G: 249, B: 255, A: 255})
 	if ev.Enabled {
 		rowBg.FillColor = color.NRGBA{R: 232, G: 240, B: 255, A: 255}
 	}
-	rowBg.SetMinSize(fyne.NewSize(0, 40))
+	rowBg.SetMinSize(fyne.NewSize(0, rowH))
 
-	// 左色条（启用时显示蓝色）
+	// 左色条（启用时蓝色）
 	sideBar := canvas.NewRectangle(color.Transparent)
-	sideBar.SetMinSize(fyne.NewSize(3, 40))
+	sideBar.SetMinSize(fyne.NewSize(3, rowH))
 	if ev.Enabled {
 		sideBar.FillColor = color.NRGBA{R: 60, G: 120, B: 240, A: 255}
 	}
@@ -347,39 +368,33 @@ func (pp *PropertiesPanel) eventRow(
 	// 启用 checkbox
 	check := widget.NewCheck("", func(v bool) {
 		onToggle(idx, v)
-		pp.content.Refresh() // 刷新整个面板以更新行背景
+		pp.content.Refresh()
 	})
 	check.Checked = ev.Enabled
 
-	// 事件名（可双击）
-	nameColor := color.NRGBA{R: 30, G: 35, B: 80, A: 255}
-	if !ev.Enabled {
-		nameColor = color.NRGBA{R: 130, G: 135, B: 160, A: 255}
-	}
+	// 事件名（可双击）+ 签名内联小字
 	nameLabel := newDoubleTapLabel(ev.EventName, func() {
 		if onOpen != nil {
 			onOpen(ev)
 		}
 	})
 	nameLabel.TextStyle = fyne.TextStyle{Bold: ev.Enabled}
-	_ = nameColor // 颜色通过 enabled 状态体现
 
-	sigTxt := canvas.NewText(kindLabelStr(ev.Kind), color.NRGBA{R: 120, G: 125, B: 160, A: 200})
+	sigTxt := canvas.NewText("  "+kindLabelStr(ev.Kind), color.NRGBA{R: 140, G: 145, B: 175, A: 180})
 	sigTxt.TextSize = 9
-	nameCol := container.NewVBox(nameLabel, container.NewPadded(sigTxt))
 
-	// 函数名输入框（紧凑）
+	nameRow := container.NewHBox(nameLabel, sigTxt)
+
+	// 函数名输入框
 	fnEntry := widget.NewEntry()
 	fnEntry.SetText(ev.HandlerFn)
 	fnEntry.PlaceHolder = "函数名"
-	fnEntry.OnChanged = func(v string) {
-		onRename(idx, v)
-	}
+	fnEntry.OnChanged = func(v string) { onRename(idx, v) }
 
 	row := container.NewBorder(nil, nil,
-		container.NewHBox(sideBar, container.NewGridWrap(fyne.NewSize(32, 40), check)),
-		container.NewGridWrap(fyne.NewSize(124, 40), fnEntry),
-		container.NewPadded(nameCol),
+		container.NewHBox(sideBar, container.NewGridWrap(fyne.NewSize(30, rowH), check)),
+		container.NewGridWrap(fyne.NewSize(120, rowH), fnEntry),
+		container.NewCenter(nameRow),
 	)
 
 	sep := canvas.NewRectangle(color.NRGBA{R: 210, G: 215, B: 235, A: 255})

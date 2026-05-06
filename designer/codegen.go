@@ -7,6 +7,10 @@ import (
 	"github.com/mico/golay/model"
 )
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 公共类型
+// ─────────────────────────────────────────────────────────────────────────────
+
 // CodeGenOptions 代码生成选项
 type CodeGenOptions struct {
 	PackageName string
@@ -27,178 +31,332 @@ func DefaultCodeGenOptions() CodeGenOptions {
 	}
 }
 
-// GenerateCode 根据多个 Form 和 MessageBox 列表生成完整的 Go 程序代码
-func GenerateCode(forms []*model.FormDef, dialogs []*model.MessageBoxDef, opts CodeGenOptions) string {
+// ProjectFiles 多文件代码生成结果
+type ProjectFiles struct {
+	Main        string            // main.go（入口，每次覆盖）
+	UIFiles     map[string]string // form_xxx.go → UI 文件（每次覆盖）
+	EventFiles  map[string]string // form_xxx_events.go → 事件文件（仅首次创建）
+	DialogsFile string            // dialogs.go（若有 MessageBox，每次覆盖）
+	HelpersFile string            // helpers.go（若有 LinkLabel，每次覆盖）
+}
+
+// UIFileName 返回 Form 的 UI 文件名
+func UIFileName(formName string) string { return "form_" + formName + ".go" }
+
+// EventsFileName 返回 Form 的事件文件名
+func EventsFileName(formName string) string { return "form_" + formName + "_events.go" }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 主入口
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GenerateProject 生成完整多文件项目
+func GenerateProject(forms []*model.FormDef, dialogs []*model.MessageBoxDef, opts CodeGenOptions) ProjectFiles {
+	pf := ProjectFiles{
+		UIFiles:    make(map[string]string),
+		EventFiles: make(map[string]string),
+	}
+
 	if len(forms) == 0 {
-		return ""
+		return pf
 	}
 
-	// 收集所有控件用于 import 分析
-	var allWidgets []*model.DesignWidget
+	// main.go
+	pf.Main = genMain(forms, opts)
+
+	// 检查是否需要 mustParseURL helper
+	needHelper := false
 	for _, f := range forms {
-		allWidgets = append(allWidgets, f.Widgets...)
-	}
-
-	var b strings.Builder
-	imports := collectImportsAll(allWidgets, dialogs)
-
-	b.WriteString(fmt.Sprintf("package %s\n\n", opts.PackageName))
-	b.WriteString("import (\n")
-	for _, imp := range imports {
-		b.WriteString(fmt.Sprintf("\t%q\n", imp))
-	}
-	b.WriteString(")\n\n")
-
-	// mustParseURL helper（如有 LinkLabel）
-	for _, dw := range allWidgets {
-		if dw.Type == model.WidgetLinkLabel {
-			b.WriteString("import \"net/url\"\n\n")
-			b.WriteString("func mustParseURL(raw string) *url.URL {\n")
-			b.WriteString("\tu, _ := url.Parse(raw)\n\treturn u\n}\n\n")
-			break
-		}
-	}
-
-	// Form 级事件处理函数
-	for _, form := range forms {
-		for _, ev := range form.Events {
-			if ev.Enabled && ev.HandlerFn != "" {
-				b.WriteString(fmt.Sprintf("// %s - Form 事件 %s\n", form.Name, ev.EventName))
-				b.WriteString(fmt.Sprintf("func %s() {\n\t// TODO: 实现逻辑\n}\n\n", ev.HandlerFn))
+		for _, dw := range f.Widgets {
+			if dw.Type == model.WidgetLinkLabel {
+				needHelper = true
 			}
 		}
 	}
+	if needHelper {
+		pf.HelpersFile = genHelpersFile(opts)
+	}
 
-	// 控件事件处理函数
-	for _, dw := range allWidgets {
-		for _, h := range buildEventHandlers([]*model.DesignWidget{dw}) {
-			b.WriteString(h)
-			b.WriteString("\n")
+	// 每个 Form 生成 UI 文件 + 事件文件
+	for i, form := range forms {
+		isMaster := i == 0
+		pf.UIFiles[UIFileName(form.Name)] = genFormUI(form, isMaster, opts)
+		if evContent := genFormEvents(form, opts); evContent != "" {
+			pf.EventFiles[EventsFileName(form.Name)] = evContent
 		}
 	}
 
-	// MessageBox 辅助函数
-	for _, mb := range dialogs {
-		b.WriteString(genMessageBoxFunc(mb))
-		b.WriteString("\n")
+	// dialogs.go
+	if len(dialogs) > 0 {
+		pf.DialogsFile = genDialogsFile(dialogs, opts)
 	}
 
-	// main()
-	mainForm := forms[0]
+	return pf
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// main.go
+// ─────────────────────────────────────────────────────────────────────────────
+
+func genMain(forms []*model.FormDef, opts CodeGenOptions) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("package %s\n\n", opts.PackageName))
+	b.WriteString("import \"fyne.io/fyne/v2/app\"\n\n")
 	b.WriteString("func main() {\n")
 	b.WriteString("\ta := app.New()\n")
-	b.WriteString(genWindowInit("w", mainForm, true))
-
-	// 主窗体 Load 事件
-	for _, ev := range mainForm.Events {
-		if ev.EventName == "Load" && ev.Enabled {
-			b.WriteString(fmt.Sprintf("\t%s()\n", ev.HandlerFn))
-		}
-	}
-
-	// 主窗体 FormClosing 事件
-	for _, ev := range mainForm.Events {
-		if ev.EventName == "FormClosing" && ev.Enabled {
-			b.WriteString(fmt.Sprintf("\tw.SetCloseIntercept(func() { %s() })\n", ev.HandlerFn))
-		}
-	}
-
-	b.WriteString("\tw.ShowAndRun()\n}\n\n")
-
-	// 子窗体函数
-	for i, form := range forms[1:] {
-		_ = i
-		b.WriteString(genSubFormFunc(form))
-		b.WriteString("\n")
-	}
-
+	structName := capitalize(forms[0].Name)
+	b.WriteString(fmt.Sprintf("\tnew%s(a).showAndRun()\n", structName))
+	b.WriteString("}\n")
 	return b.String()
 }
 
-// genWindowInit 生成窗口初始化代码（包含控件布局）
-func genWindowInit(winVar string, form *model.FormDef, isMaster bool) string {
+// ─────────────────────────────────────────────────────────────────────────────
+// form_xxx.go（UI 文件，自动生成，请勿手动修改）
+// ─────────────────────────────────────────────────────────────────────────────
+
+func genFormUI(form *model.FormDef, isMaster bool, opts CodeGenOptions) string {
 	var b strings.Builder
+	structName := capitalize(form.Name)
+	p := "f." // struct field prefix
 
-	b.WriteString(fmt.Sprintf("\t%s := a.NewWindow(%q)\n", winVar, form.Title))
-	b.WriteString(fmt.Sprintf("\t%s.Resize(fyne.NewSize(%.0f, %.0f))\n", winVar, form.Width, form.Height))
+	b.WriteString("// Code generated by golay — DO NOT EDIT\n\n")
+	b.WriteString(fmt.Sprintf("package %s\n\n", opts.PackageName))
 
+	// 收集 imports
+	imports := collectUIImports(form)
+	if len(imports) > 0 {
+		b.WriteString("import (\n")
+		for _, imp := range imports {
+			b.WriteString(fmt.Sprintf("\t%q\n", imp))
+		}
+		b.WriteString(")\n\n")
+	}
+
+	// 结构体定义
+	b.WriteString(fmt.Sprintf("// %s UI 结构体（所有控件以字段方式持有）\n", structName))
+	b.WriteString(fmt.Sprintf("type %s struct {\n", structName))
+	b.WriteString("\twindow fyne.Window\n")
+	for _, dw := range form.Widgets {
+		b.WriteString(fmt.Sprintf("\t%s %s\n", dw.Name, goWidgetType(dw)))
+		// 数据辅助字段
+		switch dw.Type {
+		case model.WidgetDataGridView, model.WidgetListView:
+			b.WriteString(fmt.Sprintf("\t%sData [][]string\n", dw.Name))
+		case model.WidgetListBox:
+			b.WriteString(fmt.Sprintf("\t%sItems []string\n", dw.Name))
+		case model.WidgetTreeView:
+			b.WriteString(fmt.Sprintf("\t%sData map[string][]string\n", dw.Name))
+		}
+	}
+	b.WriteString("}\n\n")
+
+	// 构造函数
+	b.WriteString(fmt.Sprintf("// new%s 创建并初始化窗体\n", structName))
+	b.WriteString(fmt.Sprintf("func new%s(a fyne.App) *%s {\n", structName, structName))
+	b.WriteString(fmt.Sprintf("\tf := &%s{}\n", structName))
+	b.WriteString("\tf.initUI(a)\n")
+	// Load 事件
+	for _, ev := range form.Events {
+		if ev.EventName == "Load" && ev.Enabled && ev.HandlerFn != "" {
+			b.WriteString(fmt.Sprintf("\tf.%s()\n", ev.HandlerFn))
+		}
+	}
+	b.WriteString("\treturn f\n}\n\n")
+
+	// initUI
+	b.WriteString("// initUI 初始化控件布局（自动生成，勿手动修改）\n")
+	b.WriteString(fmt.Sprintf("func (f *%s) initUI(a fyne.App) {\n", structName))
+	b.WriteString(fmt.Sprintf("\tf.window = a.NewWindow(%q)\n", form.Title))
+	b.WriteString(fmt.Sprintf("\tf.window.Resize(fyne.NewSize(%.0f, %.0f))\n", form.Width, form.Height))
+	if isMaster {
+		b.WriteString("\tf.window.SetMaster()\n")
+	}
 	if form.FixedSize {
-		b.WriteString(fmt.Sprintf("\t%s.SetFixedSize(true)\n", winVar))
+		b.WriteString("\tf.window.SetFixedSize(true)\n")
 	}
 	if form.FullScreen {
-		b.WriteString(fmt.Sprintf("\t%s.SetFullScreen(true)\n", winVar))
+		b.WriteString("\tf.window.SetFullScreen(true)\n")
 	}
-	if isMaster {
-		b.WriteString(fmt.Sprintf("\t%s.SetMaster()\n", winVar))
-	}
-	if form.IconPath != "" {
-		b.WriteString(fmt.Sprintf("\t// 设置图标: %s.SetIcon(loadIcon(%q))\n", winVar, form.IconPath))
-	}
-
 	b.WriteString("\n")
 
+	// 控件初始化
 	for _, dw := range form.Widgets {
-		code := generateWidgetInit(dw)
+		code := generateWidgetInitMethod(dw, p)
 		if code != "" {
 			b.WriteString(code)
 			b.WriteString("\n")
 		}
 	}
 
+	// 布局
 	if len(form.Widgets) > 0 {
-		b.WriteString(fmt.Sprintf("\tcontent := container.NewWithoutLayout(\n"))
+		b.WriteString("\tcontent := container.NewWithoutLayout(\n")
 		for _, dw := range form.Widgets {
-			b.WriteString(fmt.Sprintf("\t\t%s,\n", dw.Name))
+			b.WriteString(fmt.Sprintf("\t\tf.%s,\n", dw.Name))
 		}
 		b.WriteString("\t)\n\n")
-
 		for _, dw := range form.Widgets {
-			b.WriteString(fmt.Sprintf("\t%s.Move(fyne.NewPos(%.0f, %.0f))\n", dw.Name, dw.X, dw.Y))
-			b.WriteString(fmt.Sprintf("\t%s.Resize(fyne.NewSize(%.0f, %.0f))\n", dw.Name, dw.W, dw.H))
+			b.WriteString(fmt.Sprintf("\tf.%s.Move(fyne.NewPos(%.0f, %.0f))\n", dw.Name, dw.X, dw.Y))
+			b.WriteString(fmt.Sprintf("\tf.%s.Resize(fyne.NewSize(%.0f, %.0f))\n", dw.Name, dw.W, dw.H))
 		}
-		b.WriteString(fmt.Sprintf("\n\t%s.SetContent(content)\n", winVar))
+		b.WriteString("\tf.window.SetContent(content)\n")
 	} else {
-		b.WriteString(fmt.Sprintf("\t%s.SetContent(container.NewWithoutLayout())\n", winVar))
+		b.WriteString("\tf.window.SetContent(container.NewWithoutLayout())\n")
 	}
+
+	// FormClosing 事件
+	for _, ev := range form.Events {
+		if ev.EventName == "FormClosing" && ev.Enabled && ev.HandlerFn != "" {
+			b.WriteString(fmt.Sprintf("\tf.window.SetCloseIntercept(func() { f.%s() })\n", ev.HandlerFn))
+		}
+	}
+	b.WriteString("}\n\n")
+
+	// 窗体方法
+	if isMaster {
+		b.WriteString(fmt.Sprintf("func (f *%s) showAndRun() { f.window.ShowAndRun() }\n", structName))
+	}
+	b.WriteString(fmt.Sprintf("func (f *%s) show()  { f.window.Show() }\n", structName))
+	b.WriteString(fmt.Sprintf("func (f *%s) hide()  { f.window.Hide() }\n", structName))
+	b.WriteString(fmt.Sprintf("func (f *%s) close() { f.window.Close() }\n", structName))
+	if form.IsModal && !isMaster {
+		b.WriteString(fmt.Sprintf("func (f *%s) showModal() { f.window.CenterOnScreen(); f.window.Show() }\n", structName))
+	}
+
 	return b.String()
 }
 
-// genSubFormFunc 生成子窗体的 Show/ShowModal 函数
-func genSubFormFunc(form *model.FormDef) string {
+// ─────────────────────────────────────────────────────────────────────────────
+// form_xxx_events.go（事件文件，仅首次生成，用户可编辑）
+// ─────────────────────────────────────────────────────────────────────────────
+
+func genFormEvents(form *model.FormDef, opts CodeGenOptions) string {
+	structName := capitalize(form.Name)
+
+	// 收集所有需要生成的事件方法
+	type evEntry struct {
+		comment string
+		sig     string
+	}
+	var entries []evEntry
+
+	// Form 自身事件
+	for _, ev := range form.Events {
+		if !ev.Enabled || ev.HandlerFn == "" {
+			continue
+		}
+		entries = append(entries, evEntry{
+			comment: fmt.Sprintf("// %s - Form 事件 %s\n// 可通过 f.控件名 访问窗体上的其他控件", form.Name, ev.EventName),
+			sig:     fmt.Sprintf("func (f *%s) %s() {", structName, ev.HandlerFn),
+		})
+	}
+
+	// 控件事件
+	for _, dw := range form.Widgets {
+		for _, ev := range dw.EnabledEvents() {
+			entries = append(entries, evEntry{
+				comment: fmt.Sprintf("// %s - %s 事件\n// 可通过 f.控件名 访问窗体上的其他控件，例如: f.label1.SetText(\"hello\")", dw.Name, ev.EventName),
+				sig:     buildMethodSig(structName, ev),
+			})
+		}
+	}
+
+	if len(entries) == 0 {
+		return ""
+	}
+
 	var b strings.Builder
-	funcName := "Show" + capitalize(form.Name)
+	b.WriteString(fmt.Sprintf("package %s\n\n", opts.PackageName))
 
-	if form.IsModal {
-		b.WriteString(fmt.Sprintf("// %s 以模态方式显示子窗体 %s\n", funcName+"Modal", form.Title))
-		b.WriteString(fmt.Sprintf("func %sModal(a fyne.App, parent fyne.Window) {\n", funcName))
-	} else {
-		b.WriteString(fmt.Sprintf("// %s 显示子窗体 %s\n", funcName, form.Title))
-		b.WriteString(fmt.Sprintf("func %s(a fyne.App) {\n", funcName))
+	// 收集事件文件所需 imports
+	imports := collectEventImports(form)
+	if len(imports) > 0 {
+		b.WriteString("import (\n")
+		for _, imp := range imports {
+			b.WriteString(fmt.Sprintf("\t%q\n", imp))
+		}
+		b.WriteString(")\n\n")
 	}
 
-	b.WriteString(genWindowInit("w", form, false))
-
-	if form.IsModal {
-		b.WriteString("\tw.CenterOnScreen()\n")
-		b.WriteString("\tw.Show()\n")
-		// Fyne 本身没有真正的 modal block，用 Canvas 方式模拟
-		b.WriteString("\t// 模态显示：阻止父窗体操作直到此窗口关闭\n")
-		b.WriteString("\tparent.Canvas().SetOnTypedKey(nil)\n")
-		b.WriteString("\tdefer func() { /* 恢复父窗体 */ }()\n")
-	} else {
-		b.WriteString("\tw.Show()\n")
+	for _, e := range entries {
+		b.WriteString(e.comment + "\n")
+		b.WriteString(e.sig + "\n\t// TODO: 实现逻辑\n}\n\n")
 	}
-	b.WriteString("}\n")
 	return b.String()
 }
 
-// genMessageBoxFunc 生成 MessageBox 辅助函数
+func buildMethodSig(structName string, ev model.EventBinding) string {
+	switch ev.Kind {
+	case model.EventKindVoid:
+		return fmt.Sprintf("func (f *%s) %s() {", structName, ev.HandlerFn)
+	case model.EventKindString:
+		return fmt.Sprintf("func (f *%s) %s(value string) {", structName, ev.HandlerFn)
+	case model.EventKindBool:
+		return fmt.Sprintf("func (f *%s) %s(checked bool) {", structName, ev.HandlerFn)
+	case model.EventKindFloat:
+		return fmt.Sprintf("func (f *%s) %s(value float64) {", structName, ev.HandlerFn)
+	case model.EventKindInt:
+		return fmt.Sprintf("func (f *%s) %s(index int) {", structName, ev.HandlerFn)
+	case model.EventKindKey:
+		return fmt.Sprintf("func (f *%s) %s(key *fyne.KeyEvent) {", structName, ev.HandlerFn)
+	case model.EventKindMouse:
+		return fmt.Sprintf("func (f *%s) %s(ev *desktop.MouseEvent) {", structName, ev.HandlerFn)
+	case model.EventKindTableCell:
+		return fmt.Sprintf("func (f *%s) %s(row, col int) {", structName, ev.HandlerFn)
+	case model.EventKindTableChange:
+		return fmt.Sprintf("func (f *%s) %s(row, col int, value string) {", structName, ev.HandlerFn)
+	default:
+		return fmt.Sprintf("func (f *%s) %s() {", structName, ev.HandlerFn)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// dialogs.go（MessageBox 辅助函数）
+// ─────────────────────────────────────────────────────────────────────────────
+
+func genDialogsFile(dialogs []*model.MessageBoxDef, opts CodeGenOptions) string {
+	var b strings.Builder
+	b.WriteString("// Code generated by golay — DO NOT EDIT\n\n")
+	b.WriteString(fmt.Sprintf("package %s\n\n", opts.PackageName))
+
+	imports := collectDialogImports(dialogs)
+	if len(imports) > 0 {
+		b.WriteString("import (\n")
+		for _, imp := range imports {
+			b.WriteString(fmt.Sprintf("\t%q\n", imp))
+		}
+		b.WriteString(")\n\n")
+	}
+
+	for _, mb := range dialogs {
+		b.WriteString(genMessageBoxFunc(mb))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// helpers.go（工具函数，如 mustParseURL）
+// ─────────────────────────────────────────────────────────────────────────────
+
+func genHelpersFile(opts CodeGenOptions) string {
+	var b strings.Builder
+	b.WriteString("// Code generated by golay — DO NOT EDIT\n\n")
+	b.WriteString(fmt.Sprintf("package %s\n\n", opts.PackageName))
+	b.WriteString("import \"net/url\"\n\n")
+	b.WriteString("func mustParseURL(raw string) *url.URL {\n\tu, _ := url.Parse(raw)\n\treturn u\n}\n")
+	return b.String()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MessageBox 函数生成
+// ─────────────────────────────────────────────────────────────────────────────
+
 func genMessageBoxFunc(mb *model.MessageBoxDef) string {
 	var b strings.Builder
 	fnName := mb.ShowFuncName()
 	b.WriteString(fmt.Sprintf("// %s 显示消息框\n", fnName))
 	b.WriteString(fmt.Sprintf("func %s(parent fyne.Window) {\n", fnName))
-
 	switch mb.Type {
 	case model.MsgBoxInfo:
 		b.WriteString(fmt.Sprintf("\tdialog.ShowInformation(%q, %q, parent)\n", mb.Title, mb.Message))
@@ -210,8 +368,7 @@ func genMessageBoxFunc(mb *model.MessageBoxDef) string {
 		b.WriteString("\tdialog.ShowError(err, parent)\n")
 	case model.MsgBoxConfirm:
 		b.WriteString(fmt.Sprintf("\tdialog.ShowConfirm(%q, %q, func(ok bool) {\n", mb.Title, mb.Message))
-		b.WriteString("\t\t// TODO: 处理用户选择\n")
-		b.WriteString("\t\t_ = ok\n\t}, parent)\n")
+		b.WriteString("\t\t// TODO: 处理用户选择\n\t\t_ = ok\n\t}, parent)\n")
 	}
 	b.WriteString("}\n")
 	return b.String()
@@ -221,48 +378,29 @@ func genMessageBoxFunc(mb *model.MessageBoxDef) string {
 // import 收集
 // ─────────────────────────────────────────────────────────────────────────────
 
-func collectImports(widgets []*model.DesignWidget) []string {
-	return collectImportsAll(widgets, nil)
-}
-
-func collectImportsAll(widgets []*model.DesignWidget, dialogs []*model.MessageBoxDef) []string {
+func collectUIImports(form *model.FormDef) []string {
 	need := map[string]bool{
 		"fyne.io/fyne/v2":           true,
-		"fyne.io/fyne/v2/app":       true,
 		"fyne.io/fyne/v2/container": true,
 	}
-	if len(dialogs) > 0 {
-		need["fyne.io/fyne/v2/dialog"] = true
-		need["fmt"] = true
-	}
-	for _, dw := range widgets {
+	for _, dw := range form.Widgets {
 		switch dw.Type {
-		case model.WidgetButton, model.WidgetLabel, model.WidgetTextBox,
-			model.WidgetMultiLineEntry, model.WidgetComboBox, model.WidgetCheckBox,
-			model.WidgetRadioButton, model.WidgetSlider, model.WidgetProgressBar,
-			model.WidgetSeparator, model.WidgetRichTextBox, model.WidgetLinkLabel,
-			model.WidgetListBox, model.WidgetDataGridView, model.WidgetTreeView,
-			model.WidgetToolStrip, model.WidgetStatusStrip:
-			need["fyne.io/fyne/v2/widget"] = true
 		case model.WidgetPictureBox:
 			need["fyne.io/fyne/v2/canvas"] = true
-		case model.WidgetGroupBox, model.WidgetTabControl:
+		case model.WidgetPanel:
+			// 只需 container，已有
+		default:
 			need["fyne.io/fyne/v2/widget"] = true
 		}
-		for _, ev := range dw.EnabledEvents() {
-			if ev.Kind == model.EventKindMouse || ev.Kind == model.EventKindKey {
-				need["fyne.io/fyne/v2/driver/desktop"] = true
-			}
+		if dw.Type == model.WidgetToolStrip {
+			need["fyne.io/fyne/v2/theme"] = true
 		}
 	}
 	order := []string{
-		"fmt",
 		"fyne.io/fyne/v2",
-		"fyne.io/fyne/v2/app",
 		"fyne.io/fyne/v2/canvas",
 		"fyne.io/fyne/v2/container",
-		"fyne.io/fyne/v2/dialog",
-		"fyne.io/fyne/v2/driver/desktop",
+		"fyne.io/fyne/v2/theme",
 		"fyne.io/fyne/v2/widget",
 	}
 	var result []string
@@ -274,158 +412,207 @@ func collectImportsAll(widgets []*model.DesignWidget, dialogs []*model.MessageBo
 	return result
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 事件处理函数生成
-// ─────────────────────────────────────────────────────────────────────────────
-
-func buildEventHandlers(widgets []*model.DesignWidget) []string {
-	var result []string
-	for _, dw := range widgets {
+func collectEventImports(form *model.FormDef) []string {
+	need := map[string]bool{}
+	for _, dw := range form.Widgets {
 		for _, ev := range dw.EnabledEvents() {
-			result = append(result, buildHandlerFunc(dw, ev))
+			switch ev.Kind {
+			case model.EventKindKey:
+				need["fyne.io/fyne/v2"] = true
+			case model.EventKindMouse:
+				need["fyne.io/fyne/v2"] = true
+				need["fyne.io/fyne/v2/driver/desktop"] = true
+			}
+		}
+	}
+	order := []string{"fyne.io/fyne/v2", "fyne.io/fyne/v2/driver/desktop"}
+	var result []string
+	for _, imp := range order {
+		if need[imp] {
+			result = append(result, imp)
 		}
 	}
 	return result
 }
 
-func buildHandlerFunc(dw *model.DesignWidget, ev model.EventBinding) string {
-	comment := fmt.Sprintf("// %s - %s 事件", dw.Name, ev.EventName)
-	var sig string
-	switch ev.Kind {
-	case model.EventKindVoid:
-		sig = fmt.Sprintf("func %s() {", ev.HandlerFn)
-	case model.EventKindString:
-		sig = fmt.Sprintf("func %s(value string) {", ev.HandlerFn)
-	case model.EventKindBool:
-		sig = fmt.Sprintf("func %s(checked bool) {", ev.HandlerFn)
-	case model.EventKindFloat:
-		sig = fmt.Sprintf("func %s(value float64) {", ev.HandlerFn)
-	case model.EventKindInt:
-		sig = fmt.Sprintf("func %s(index int) {", ev.HandlerFn)
-	case model.EventKindKey:
-		sig = fmt.Sprintf("func %s(key *fyne.KeyEvent) {", ev.HandlerFn)
-	case model.EventKindMouse:
-		sig = fmt.Sprintf("func %s(ev *desktop.MouseEvent) {", ev.HandlerFn)
-	case model.EventKindTableCell:
-		sig = fmt.Sprintf("func %s(row, col int) {", ev.HandlerFn)
-	case model.EventKindTableChange:
-		sig = fmt.Sprintf("func %s(row, col int, value string) {", ev.HandlerFn)
-	default:
-		sig = fmt.Sprintf("func %s() {", ev.HandlerFn)
+func collectDialogImports(dialogs []*model.MessageBoxDef) []string {
+	need := map[string]bool{
+		"fyne.io/fyne/v2":        true,
+		"fyne.io/fyne/v2/dialog": true,
 	}
-	return fmt.Sprintf("%s\n%s\n\t// TODO: 实现逻辑\n}\n", comment, sig)
+	for _, mb := range dialogs {
+		if mb.Type != model.MsgBoxInfo {
+			need["fmt"] = true
+		}
+	}
+	order := []string{"fmt", "fyne.io/fyne/v2", "fyne.io/fyne/v2/dialog"}
+	var result []string
+	for _, imp := range order {
+		if need[imp] {
+			result = append(result, imp)
+		}
+	}
+	return result
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 控件初始化代码生成
+// 控件 Go 类型映射
 // ─────────────────────────────────────────────────────────────────────────────
 
-func generateWidgetInit(dw *model.DesignWidget) string {
+func goWidgetType(dw *model.DesignWidget) string {
 	switch dw.Type {
 	case model.WidgetButton:
-		return genButton(dw)
+		return "*widget.Button"
 	case model.WidgetLabel:
-		return genLabel(dw)
+		return "*widget.Label"
 	case model.WidgetLinkLabel:
-		return genLinkLabel(dw)
-	case model.WidgetTextBox:
-		return genTextBox(dw)
-	case model.WidgetMultiLineEntry:
-		return genMultiLineEntry(dw)
+		return "*widget.Hyperlink"
+	case model.WidgetTextBox, model.WidgetMultiLineEntry, model.WidgetDateTimePicker:
+		return "*widget.Entry"
 	case model.WidgetRichTextBox:
-		return genRichTextBox(dw)
+		return "*widget.RichText"
 	case model.WidgetComboBox:
-		return genComboBox(dw)
+		return "*widget.Select"
 	case model.WidgetCheckBox:
-		return genCheckBox(dw)
+		return "*widget.Check"
 	case model.WidgetRadioButton:
-		return genRadioButton(dw)
-	case model.WidgetDateTimePicker:
-		return genDateTimePicker(dw)
+		return "*widget.RadioGroup"
 	case model.WidgetSlider:
-		return genSlider(dw)
+		return "*widget.Slider"
 	case model.WidgetProgressBar:
-		return genProgressBar(dw)
-	case model.WidgetSeparator:
-		return fmt.Sprintf("\t%s := widget.NewSeparator()\n", dw.Name)
+		return "*widget.ProgressBar"
+	case model.WidgetSeparator, model.WidgetStatusStrip:
+		return "*widget.Label"
 	case model.WidgetPanel:
-		return genPanel(dw)
+		return "*fyne.Container"
 	case model.WidgetGroupBox:
-		return genGroupBox(dw)
+		return "*widget.Card"
 	case model.WidgetTabControl:
-		return genTabControl(dw)
+		return "*container.AppTabs"
 	case model.WidgetToolStrip:
-		return genToolStrip(dw)
-	case model.WidgetDataGridView:
-		return genDataGridView(dw)
+		return "*widget.Toolbar"
+	case model.WidgetDataGridView, model.WidgetListView:
+		return "*widget.Table"
 	case model.WidgetListBox:
-		return genListBox(dw)
-	case model.WidgetListView:
-		return genListView(dw)
+		return "*widget.List"
 	case model.WidgetTreeView:
-		return genTreeView(dw)
-	case model.WidgetStatusStrip:
-		return genStatusStrip(dw)
+		return "*widget.Tree"
 	case model.WidgetPictureBox:
-		return genPictureBox(dw)
+		return "*canvas.Image"
+	default:
+		return "fyne.CanvasObject"
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 控件初始化代码（结构体方法版，p = "f."）
+// ─────────────────────────────────────────────────────────────────────────────
+
+func generateWidgetInitMethod(dw *model.DesignWidget, p string) string {
+	switch dw.Type {
+	case model.WidgetButton:
+		return genButton(dw, p)
+	case model.WidgetLabel:
+		return genLabel(dw, p)
+	case model.WidgetLinkLabel:
+		return genLinkLabel(dw, p)
+	case model.WidgetTextBox:
+		return genTextBox(dw, p)
+	case model.WidgetMultiLineEntry:
+		return genMultiLineEntry(dw, p)
+	case model.WidgetRichTextBox:
+		return genRichTextBox(dw, p)
+	case model.WidgetComboBox:
+		return genComboBox(dw, p)
+	case model.WidgetCheckBox:
+		return genCheckBox(dw, p)
+	case model.WidgetRadioButton:
+		return genRadioButton(dw, p)
+	case model.WidgetDateTimePicker:
+		return genDateTimePicker(dw, p)
+	case model.WidgetSlider:
+		return genSlider(dw, p)
+	case model.WidgetProgressBar:
+		return genProgressBar(dw, p)
+	case model.WidgetSeparator:
+		return fmt.Sprintf("\t%s%s = widget.NewSeparator()\n", p, dw.Name)
+	case model.WidgetPanel:
+		return fmt.Sprintf("\t%s%s = container.NewWithoutLayout()\n", p, dw.Name)
+	case model.WidgetGroupBox:
+		return genGroupBox(dw, p)
+	case model.WidgetTabControl:
+		return genTabControl(dw, p)
+	case model.WidgetToolStrip:
+		return genToolStrip(dw, p)
+	case model.WidgetDataGridView:
+		return genDataGridView(dw, p)
+	case model.WidgetListBox:
+		return genListBox(dw, p)
+	case model.WidgetListView:
+		return genListView(dw, p)
+	case model.WidgetTreeView:
+		return genTreeView(dw, p)
+	case model.WidgetStatusStrip:
+		text := dw.GetProperty("Text")
+		return fmt.Sprintf("\t%s%s = widget.NewLabel(%q)\n", p, dw.Name, text)
+	case model.WidgetPictureBox:
+		return genPictureBox(dw, p)
 	}
 	return fmt.Sprintf("\t// TODO: %s (%s) 控件待实现\n", dw.Name, model.GetWidgetTypeInfo(dw.Type).Name)
 }
 
-// ── 各控件代码生成 ────────────────────────────────────────────────────────────
+// ── 各控件代码生成（p = "f." 表示结构体字段前缀）────────────────────────────
 
-func genButton(dw *model.DesignWidget) string {
+func genButton(dw *model.DesignWidget, p string) string {
 	text := dw.GetProperty("Text")
 	style := dw.GetProperty("Style")
 	enabled := dw.GetProperty("Enabled") != "false"
-
-	// 找 Click 回调
-	cb := findCallback(dw, "Click")
+	cb := cbRef(dw, "Click", p)
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\t%s := widget.NewButton(%q, %s)\n", dw.Name, text, cb))
+	b.WriteString(fmt.Sprintf("\t%s%s = widget.NewButton(%q, %s)\n", p, dw.Name, text, cb))
 	switch style {
 	case "Primary":
-		b.WriteString(fmt.Sprintf("\t%s.Importance = widget.HighImportance\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s.Importance = widget.HighImportance\n", p, dw.Name))
 	case "Warning":
-		b.WriteString(fmt.Sprintf("\t%s.Importance = widget.MediumImportance\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s.Importance = widget.MediumImportance\n", p, dw.Name))
 	case "Danger":
-		b.WriteString(fmt.Sprintf("\t%s.Importance = widget.DangerImportance\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s.Importance = widget.DangerImportance\n", p, dw.Name))
 	case "Low":
-		b.WriteString(fmt.Sprintf("\t%s.Importance = widget.LowImportance\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s.Importance = widget.LowImportance\n", p, dw.Name))
 	}
 	if !enabled {
-		b.WriteString(fmt.Sprintf("\t%s.Disable()\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s.Disable()\n", p, dw.Name))
 	}
 	return b.String()
 }
 
-func genLabel(dw *model.DesignWidget) string {
+func genLabel(dw *model.DesignWidget, p string) string {
 	text := dw.GetProperty("Text")
 	bold := dw.GetProperty("Bold") == "true"
 	align := dw.GetProperty("TextAlign")
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\t%s := widget.NewLabel(%q)\n", dw.Name, text))
+	b.WriteString(fmt.Sprintf("\t%s%s = widget.NewLabel(%q)\n", p, dw.Name, text))
 	if bold {
-		b.WriteString(fmt.Sprintf("\t%s.TextStyle = fyne.TextStyle{Bold: true}\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s.TextStyle = fyne.TextStyle{Bold: true}\n", p, dw.Name))
 	}
 	switch align {
 	case "Center":
-		b.WriteString(fmt.Sprintf("\t%s.Alignment = fyne.TextAlignCenter\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s.Alignment = fyne.TextAlignCenter\n", p, dw.Name))
 	case "Right":
-		b.WriteString(fmt.Sprintf("\t%s.Alignment = fyne.TextAlignTrailing\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s.Alignment = fyne.TextAlignTrailing\n", p, dw.Name))
 	}
 	return b.String()
 }
 
-func genLinkLabel(dw *model.DesignWidget) string {
+func genLinkLabel(dw *model.DesignWidget, p string) string {
 	text := dw.GetProperty("Text")
-	url := dw.GetProperty("URL")
-	return fmt.Sprintf("\t%s := widget.NewHyperlink(%q, mustParseURL(%q))\n", dw.Name, text, url)
+	rawURL := dw.GetProperty("URL")
+	return fmt.Sprintf("\t%s%s = widget.NewHyperlink(%q, mustParseURL(%q))\n", p, dw.Name, text, rawURL)
 }
 
-func genTextBox(dw *model.DesignWidget) string {
+func genTextBox(dw *model.DesignWidget, p string) string {
 	password := dw.GetProperty("Password") == "true"
 	placeholder := dw.GetProperty("PlaceHolder")
 	text := dw.GetProperty("Text")
@@ -434,113 +621,104 @@ func genTextBox(dw *model.DesignWidget) string {
 
 	var b strings.Builder
 	if password {
-		b.WriteString(fmt.Sprintf("\t%s := widget.NewPasswordEntry()\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s = widget.NewPasswordEntry()\n", p, dw.Name))
 	} else {
-		b.WriteString(fmt.Sprintf("\t%s := widget.NewEntry()\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s = widget.NewEntry()\n", p, dw.Name))
 	}
 	if placeholder != "" {
-		b.WriteString(fmt.Sprintf("\t%s.PlaceHolder = %q\n", dw.Name, placeholder))
+		b.WriteString(fmt.Sprintf("\t%s%s.PlaceHolder = %q\n", p, dw.Name, placeholder))
 	}
 	if text != "" {
-		b.WriteString(fmt.Sprintf("\t%s.SetText(%q)\n", dw.Name, text))
+		b.WriteString(fmt.Sprintf("\t%s%s.SetText(%q)\n", p, dw.Name, text))
 	}
 	for _, ev := range dw.EnabledEvents() {
-		switch ev.EventName {
-		case "TextChanged":
-			b.WriteString(fmt.Sprintf("\t%s.OnChanged = %s\n", dw.Name, ev.HandlerFn))
-		case "KeyPress":
-			b.WriteString(fmt.Sprintf("\t// %s: KeyPress 事件需在 desktop.Keyable 实现中处理\n", dw.Name))
+		if ev.EventName == "TextChanged" {
+			b.WriteString(fmt.Sprintf("\t%s%s.OnChanged = %s%s\n", p, dw.Name, p, ev.HandlerFn))
 		}
 	}
-	if readonly {
-		b.WriteString(fmt.Sprintf("\t%s.Disable()\n", dw.Name))
-	} else if !enabled {
-		b.WriteString(fmt.Sprintf("\t%s.Disable()\n", dw.Name))
+	if readonly || !enabled {
+		b.WriteString(fmt.Sprintf("\t%s%s.Disable()\n", p, dw.Name))
 	}
 	return b.String()
 }
 
-func genMultiLineEntry(dw *model.DesignWidget) string {
+func genMultiLineEntry(dw *model.DesignWidget, p string) string {
 	placeholder := dw.GetProperty("PlaceHolder")
 	text := dw.GetProperty("Text")
 	readonly := dw.GetProperty("ReadOnly") == "true"
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\t%s := widget.NewMultiLineEntry()\n", dw.Name))
+	b.WriteString(fmt.Sprintf("\t%s%s = widget.NewMultiLineEntry()\n", p, dw.Name))
 	if placeholder != "" {
-		b.WriteString(fmt.Sprintf("\t%s.PlaceHolder = %q\n", dw.Name, placeholder))
+		b.WriteString(fmt.Sprintf("\t%s%s.PlaceHolder = %q\n", p, dw.Name, placeholder))
 	}
 	if text != "" {
-		b.WriteString(fmt.Sprintf("\t%s.SetText(%q)\n", dw.Name, text))
+		b.WriteString(fmt.Sprintf("\t%s%s.SetText(%q)\n", p, dw.Name, text))
 	}
 	for _, ev := range dw.EnabledEvents() {
 		if ev.EventName == "TextChanged" {
-			b.WriteString(fmt.Sprintf("\t%s.OnChanged = %s\n", dw.Name, ev.HandlerFn))
+			b.WriteString(fmt.Sprintf("\t%s%s.OnChanged = %s%s\n", p, dw.Name, p, ev.HandlerFn))
 		}
 	}
 	if readonly {
-		b.WriteString(fmt.Sprintf("\t%s.Disable()\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s.Disable()\n", p, dw.Name))
 	}
 	return b.String()
 }
 
-func genRichTextBox(dw *model.DesignWidget) string {
+func genRichTextBox(dw *model.DesignWidget, p string) string {
 	text := dw.GetProperty("Text")
-	readonly := dw.GetProperty("ReadOnly") == "true"
-
 	var b strings.Builder
-	if readonly {
-		b.WriteString(fmt.Sprintf("\t%s := widget.NewRichTextFromMarkdown(%q)\n", dw.Name, text))
-	} else {
-		b.WriteString(fmt.Sprintf("\t%s := widget.NewRichTextFromMarkdown(%q)\n", dw.Name, text))
-		b.WriteString(fmt.Sprintf("\t%s.Wrapping = fyne.TextWrapWord\n", dw.Name))
+	b.WriteString(fmt.Sprintf("\t%s%s = widget.NewRichTextFromMarkdown(%q)\n", p, dw.Name, text))
+	if dw.GetProperty("ReadOnly") != "true" {
+		b.WriteString(fmt.Sprintf("\t%s%s.Wrapping = fyne.TextWrapWord\n", p, dw.Name))
 	}
 	return b.String()
 }
 
-func genComboBox(dw *model.DesignWidget) string {
+func genComboBox(dw *model.DesignWidget, p string) string {
 	items := splitCSV(dw.GetProperty("Items"))
 	selIdx := parseInt(dw.GetProperty("SelectedIndex"), 0)
 
 	cb := "nil"
 	for _, ev := range dw.EnabledEvents() {
 		if ev.EventName == "SelectedIndexChanged" || ev.EventName == "TextChanged" {
-			cb = ev.HandlerFn
+			cb = p + ev.HandlerFn
 			break
 		}
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\t%s := widget.NewSelect(%s, %s)\n", dw.Name, formatSlice(items), cb))
+	b.WriteString(fmt.Sprintf("\t%s%s = widget.NewSelect(%s, %s)\n", p, dw.Name, formatSlice(items), cb))
 	if selIdx >= 0 && selIdx < len(items) {
-		b.WriteString(fmt.Sprintf("\t%s.Selected = %q\n", dw.Name, items[selIdx]))
+		b.WriteString(fmt.Sprintf("\t%s%s.Selected = %q\n", p, dw.Name, items[selIdx]))
 	}
 	return b.String()
 }
 
-func genCheckBox(dw *model.DesignWidget) string {
+func genCheckBox(dw *model.DesignWidget, p string) string {
 	text := dw.GetProperty("Text")
 	checked := dw.GetProperty("Checked") == "true"
 
 	cb := "nil"
 	for _, ev := range dw.EnabledEvents() {
 		if ev.EventName == "CheckedChanged" {
-			cb = ev.HandlerFn
+			cb = p + ev.HandlerFn
 		}
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\t%s := widget.NewCheck(%q, %s)\n", dw.Name, text, cb))
+	b.WriteString(fmt.Sprintf("\t%s%s = widget.NewCheck(%q, %s)\n", p, dw.Name, text, cb))
 	if checked {
-		b.WriteString(fmt.Sprintf("\t%s.Checked = true\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s.Checked = true\n", p, dw.Name))
 	}
 	if dw.GetProperty("Enabled") == "false" {
-		b.WriteString(fmt.Sprintf("\t%s.Disable()\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s.Disable()\n", p, dw.Name))
 	}
 	return b.String()
 }
 
-func genRadioButton(dw *model.DesignWidget) string {
+func genRadioButton(dw *model.DesignWidget, p string) string {
 	opts := splitCSV(dw.GetProperty("Options"))
 	selected := dw.GetProperty("Selected")
 	horizontal := dw.GetProperty("Horizontal") == "true"
@@ -548,63 +726,62 @@ func genRadioButton(dw *model.DesignWidget) string {
 	cb := "nil"
 	for _, ev := range dw.EnabledEvents() {
 		if ev.EventName == "CheckedChanged" {
-			cb = ev.HandlerFn
+			cb = p + ev.HandlerFn
 		}
 	}
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\t%s := widget.NewRadioGroup(%s, %s)\n", dw.Name, formatSlice(opts), cb))
+	b.WriteString(fmt.Sprintf("\t%s%s = widget.NewRadioGroup(%s, %s)\n", p, dw.Name, formatSlice(opts), cb))
 	if selected != "" {
-		b.WriteString(fmt.Sprintf("\t%s.Selected = %q\n", dw.Name, selected))
+		b.WriteString(fmt.Sprintf("\t%s%s.Selected = %q\n", p, dw.Name, selected))
 	}
 	if horizontal {
-		b.WriteString(fmt.Sprintf("\t%s.Horizontal = true\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s.Horizontal = true\n", p, dw.Name))
 	}
 	return b.String()
 }
 
-func genDateTimePicker(dw *model.DesignWidget) string {
+func genDateTimePicker(dw *model.DesignWidget, p string) string {
 	format := dw.GetProperty("Format")
 	value := dw.GetProperty("Value")
 	showTime := dw.GetProperty("ShowTime") == "true"
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\t// DateTimePicker: %s\n", dw.Name))
-	b.WriteString(fmt.Sprintf("\t%s := widget.NewEntry()\n", dw.Name))
+	b.WriteString(fmt.Sprintf("\t%s%s = widget.NewEntry()\n", p, dw.Name))
 	if value != "" {
-		b.WriteString(fmt.Sprintf("\t%s.SetText(%q)\n", dw.Name, value))
+		b.WriteString(fmt.Sprintf("\t%s%s.SetText(%q)\n", p, dw.Name, value))
 	} else {
+		ph := format
 		if showTime {
-			b.WriteString(fmt.Sprintf("\t%s.PlaceHolder = %q\n", dw.Name, format+" 15:04:05"))
-		} else {
-			b.WriteString(fmt.Sprintf("\t%s.PlaceHolder = %q\n", dw.Name, format))
+			ph += " 15:04:05"
 		}
+		b.WriteString(fmt.Sprintf("\t%s%s.PlaceHolder = %q\n", p, dw.Name, ph))
 	}
 	for _, ev := range dw.EnabledEvents() {
 		if ev.EventName == "ValueChanged" {
-			b.WriteString(fmt.Sprintf("\t%s.OnChanged = %s\n", dw.Name, ev.HandlerFn))
+			b.WriteString(fmt.Sprintf("\t%s%s.OnChanged = %s%s\n", p, dw.Name, p, ev.HandlerFn))
 		}
 	}
 	return b.String()
 }
 
-func genSlider(dw *model.DesignWidget) string {
+func genSlider(dw *model.DesignWidget, p string) string {
 	min := parseFloat(dw.GetProperty("Min"), 0)
 	max := parseFloat(dw.GetProperty("Max"), 100)
 	val := parseFloat(dw.GetProperty("Value"), 0)
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\t%s := widget.NewSlider(%.0f, %.0f)\n", dw.Name, min, max))
-	b.WriteString(fmt.Sprintf("\t%s.Value = %.0f\n", dw.Name, val))
+	b.WriteString(fmt.Sprintf("\t%s%s = widget.NewSlider(%.0f, %.0f)\n", p, dw.Name, min, max))
+	b.WriteString(fmt.Sprintf("\t%s%s.Value = %.0f\n", p, dw.Name, val))
 	for _, ev := range dw.EnabledEvents() {
 		if ev.EventName == "ValueChanged" {
-			b.WriteString(fmt.Sprintf("\t%s.OnChanged = %s\n", dw.Name, ev.HandlerFn))
+			b.WriteString(fmt.Sprintf("\t%s%s.OnChanged = %s%s\n", p, dw.Name, p, ev.HandlerFn))
 		}
 	}
 	return b.String()
 }
 
-func genProgressBar(dw *model.DesignWidget) string {
+func genProgressBar(dw *model.DesignWidget, p string) string {
 	min := parseFloat(dw.GetProperty("Min"), 0)
 	max := parseFloat(dw.GetProperty("Max"), 100)
 	val := parseFloat(dw.GetProperty("Value"), 50)
@@ -612,60 +789,53 @@ func genProgressBar(dw *model.DesignWidget) string {
 
 	var b strings.Builder
 	if infinite {
-		b.WriteString(fmt.Sprintf("\t%s := widget.NewProgressBarInfinite()\n", dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s = widget.NewProgressBarInfinite()\n", p, dw.Name))
 	} else {
-		b.WriteString(fmt.Sprintf("\t%s := widget.NewProgressBar()\n", dw.Name))
-		b.WriteString(fmt.Sprintf("\t%s.Min = %.2f\n", dw.Name, min))
-		b.WriteString(fmt.Sprintf("\t%s.Max = %.2f\n", dw.Name, max))
-		b.WriteString(fmt.Sprintf("\t%s.Value = %.2f\n", dw.Name, val))
+		b.WriteString(fmt.Sprintf("\t%s%s = widget.NewProgressBar()\n", p, dw.Name))
+		b.WriteString(fmt.Sprintf("\t%s%s.Min = %.2f\n", p, dw.Name, min))
+		b.WriteString(fmt.Sprintf("\t%s%s.Max = %.2f\n", p, dw.Name, max))
+		b.WriteString(fmt.Sprintf("\t%s%s.Value = %.2f\n", p, dw.Name, val))
 	}
 	return b.String()
 }
 
-func genPanel(dw *model.DesignWidget) string {
-	return fmt.Sprintf("\t%s := container.NewWithoutLayout() // Panel: 可向其中添加子控件\n", dw.Name)
-}
-
-func genGroupBox(dw *model.DesignWidget) string {
+func genGroupBox(dw *model.DesignWidget, p string) string {
 	title := dw.GetProperty("Text")
-	return fmt.Sprintf("\t%s := widget.NewCard(%q, \"\", container.NewWithoutLayout())\n", dw.Name, title)
+	return fmt.Sprintf("\t%s%s = widget.NewCard(%q, \"\", container.NewWithoutLayout())\n", p, dw.Name, title)
 }
 
-func genTabControl(dw *model.DesignWidget) string {
-	tabsStr := dw.GetProperty("Tabs")
-	tabs := splitCSV(tabsStr)
+func genTabControl(dw *model.DesignWidget, p string) string {
+	tabs := splitCSV(dw.GetProperty("Tabs"))
+	selIdx := parseInt(dw.GetProperty("SelectedIndex"), 0)
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\t%s := container.NewAppTabs(\n", dw.Name))
+	b.WriteString(fmt.Sprintf("\t%s%s = container.NewAppTabs(\n", p, dw.Name))
 	for _, tab := range tabs {
-		tab = strings.TrimSpace(tab)
-		b.WriteString(fmt.Sprintf("\t\tcontainer.NewTabItem(%q, container.NewWithoutLayout()),\n", tab))
+		b.WriteString(fmt.Sprintf("\t\tcontainer.NewTabItem(%q, container.NewWithoutLayout()),\n", strings.TrimSpace(tab)))
 	}
 	b.WriteString("\t)\n")
-
-	selIdx := parseInt(dw.GetProperty("SelectedIndex"), 0)
 	if selIdx > 0 {
-		b.WriteString(fmt.Sprintf("\t%s.SelectIndex(%d)\n", dw.Name, selIdx))
+		b.WriteString(fmt.Sprintf("\t%s%s.SelectIndex(%d)\n", p, dw.Name, selIdx))
 	}
 	for _, ev := range dw.EnabledEvents() {
 		if ev.EventName == "SelectedIndexChanged" {
-			b.WriteString(fmt.Sprintf("\t%s.OnChanged = func(tab *container.TabItem) {\n", dw.Name))
-			b.WriteString(fmt.Sprintf("\t\t%s(%s.SelectedIndex())\n\t}\n", ev.HandlerFn, dw.Name))
+			b.WriteString(fmt.Sprintf("\t%s%s.OnChanged = func(tab *container.TabItem) {\n", p, dw.Name))
+			b.WriteString(fmt.Sprintf("\t\tf.%s(%s%s.SelectedIndex())\n\t}\n", ev.HandlerFn, p, dw.Name))
 		}
 	}
 	return b.String()
 }
 
-func genToolStrip(dw *model.DesignWidget) string {
+func genToolStrip(dw *model.DesignWidget, p string) string {
 	items := strings.Split(dw.GetProperty("Items"), ",")
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\t%s := widget.NewToolbar(\n", dw.Name))
+	b.WriteString(fmt.Sprintf("\t%s%s = widget.NewToolbar(\n", p, dw.Name))
 	for _, item := range items {
 		item = strings.TrimSpace(item)
 		if item == "|" {
 			b.WriteString("\t\twidget.NewToolbarSeparator(),\n")
 		} else {
-			b.WriteString(fmt.Sprintf("\t\twidget.NewToolbarAction(theme.DocumentIcon(), func() {\n"))
+			b.WriteString("\t\twidget.NewToolbarAction(theme.DocumentIcon(), func() {\n")
 			b.WriteString(fmt.Sprintf("\t\t\t// TODO: %s 点击\n\t\t}),\n", item))
 		}
 	}
@@ -673,80 +843,73 @@ func genToolStrip(dw *model.DesignWidget) string {
 	return b.String()
 }
 
-func genDataGridView(dw *model.DesignWidget) string {
+func genDataGridView(dw *model.DesignWidget, p string) string {
 	cols := splitCSV(dw.GetProperty("Columns"))
 	colLen := len(cols)
 
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\t// DataGridView: %s\n", dw.Name))
-	b.WriteString(fmt.Sprintf("\t%sData := [][]string{}\n", dw.Name))
-	b.WriteString(fmt.Sprintf("\t%s := widget.NewTable(\n", dw.Name))
-	b.WriteString(fmt.Sprintf("\t\tfunc() (int, int) { return len(%sData), %d },\n", dw.Name, colLen))
+	b.WriteString(fmt.Sprintf("\t%s%sData = [][]string{}\n", p, dw.Name))
+	b.WriteString(fmt.Sprintf("\t%s%s = widget.NewTable(\n", p, dw.Name))
+	b.WriteString(fmt.Sprintf("\t\tfunc() (int, int) { return len(%s%sData), %d },\n", p, dw.Name, colLen))
 	b.WriteString("\t\tfunc() fyne.CanvasObject { return widget.NewLabel(\"\") },\n")
 	b.WriteString(fmt.Sprintf("\t\tfunc(id widget.TableCellID, obj fyne.CanvasObject) {\n"))
-	b.WriteString(fmt.Sprintf("\t\t\tif id.Row < len(%sData) && id.Col < len(%sData[id.Row]) {\n", dw.Name, dw.Name))
-	b.WriteString(fmt.Sprintf("\t\t\t\tobj.(*widget.Label).SetText(%sData[id.Row][id.Col])\n\t\t\t}\n", dw.Name))
+	b.WriteString(fmt.Sprintf("\t\t\tif id.Row < len(%s%sData) && id.Col < len(%s%sData[id.Row]) {\n", p, dw.Name, p, dw.Name))
+	b.WriteString(fmt.Sprintf("\t\t\t\tobj.(*widget.Label).SetText(%s%sData[id.Row][id.Col])\n\t\t\t}\n", p, dw.Name))
 	b.WriteString("\t\t},\n\t)\n")
-
-	// 表头
-	b.WriteString(fmt.Sprintf("\t%s.ShowHeaderRow = true\n", dw.Name))
-	b.WriteString(fmt.Sprintf("\t%s.CreateHeader = func() fyne.CanvasObject { return widget.NewLabel(\"\") }\n", dw.Name))
-	b.WriteString(fmt.Sprintf("\t%s.UpdateHeader = func(id widget.TableCellID, obj fyne.CanvasObject) {\n", dw.Name))
+	b.WriteString(fmt.Sprintf("\t%s%s.ShowHeaderRow = true\n", p, dw.Name))
+	b.WriteString(fmt.Sprintf("\t%s%s.CreateHeader = func() fyne.CanvasObject { return widget.NewLabel(\"\") }\n", p, dw.Name))
+	b.WriteString(fmt.Sprintf("\t%s%s.UpdateHeader = func(id widget.TableCellID, obj fyne.CanvasObject) {\n", p, dw.Name))
 	b.WriteString(fmt.Sprintf("\t\theaders := %s\n", formatSlice(cols)))
 	b.WriteString("\t\tif id.Col < len(headers) { obj.(*widget.Label).SetText(headers[id.Col]) }\n\t}\n")
-
-	// 事件
 	for _, ev := range dw.EnabledEvents() {
 		switch ev.EventName {
 		case "CellClick":
-			b.WriteString(fmt.Sprintf("\t%s.OnSelected = func(id widget.TableCellID) { %s(id.Row, id.Col) }\n", dw.Name, ev.HandlerFn))
+			b.WriteString(fmt.Sprintf("\t%s%s.OnSelected = func(id widget.TableCellID) { f.%s(id.Row, id.Col) }\n", p, dw.Name, ev.HandlerFn))
 		case "SelectionChanged":
-			b.WriteString(fmt.Sprintf("\t%s.OnSelected = func(id widget.TableCellID) { %s(id.Row) }\n", dw.Name, ev.HandlerFn))
+			b.WriteString(fmt.Sprintf("\t%s%s.OnSelected = func(id widget.TableCellID) { f.%s(id.Row) }\n", p, dw.Name, ev.HandlerFn))
 		}
 	}
 	return b.String()
 }
 
-func genListBox(dw *model.DesignWidget) string {
+func genListBox(dw *model.DesignWidget, p string) string {
 	items := splitCSV(dw.GetProperty("Items"))
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\t%sItems := %s\n", dw.Name, formatSlice(items)))
+	b.WriteString(fmt.Sprintf("\t%s%sItems = %s\n", p, dw.Name, formatSlice(items)))
 	cb := "nil"
 	for _, ev := range dw.EnabledEvents() {
 		if ev.EventName == "SelectedIndexChanged" {
-			cb = ev.HandlerFn
+			cb = "func(id widget.ListItemID) { f." + ev.HandlerFn + "(int(id)) }"
 		}
 	}
-	b.WriteString(fmt.Sprintf("\t%s := widget.NewList(\n", dw.Name))
-	b.WriteString(fmt.Sprintf("\t\tfunc() int { return len(%sItems) },\n", dw.Name))
+	b.WriteString(fmt.Sprintf("\t%s%s = widget.NewList(\n", p, dw.Name))
+	b.WriteString(fmt.Sprintf("\t\tfunc() int { return len(%s%sItems) },\n", p, dw.Name))
 	b.WriteString("\t\tfunc() fyne.CanvasObject { return widget.NewLabel(\"\") },\n")
-	b.WriteString(fmt.Sprintf("\t\tfunc(id widget.ListItemID, obj fyne.CanvasObject) {\n\t\t\tobj.(*widget.Label).SetText(%sItems[id])\n\t\t},\n", dw.Name))
+	b.WriteString(fmt.Sprintf("\t\tfunc(id widget.ListItemID, obj fyne.CanvasObject) {\n\t\t\tobj.(*widget.Label).SetText(%s%sItems[id])\n\t\t},\n", p, dw.Name))
 	b.WriteString("\t)\n")
 	if cb != "nil" {
-		b.WriteString(fmt.Sprintf("\t%s.OnSelected = func(id widget.ListItemID) { %s(int(id)) }\n", dw.Name, cb))
+		b.WriteString(fmt.Sprintf("\t%s%s.OnSelected = %s\n", p, dw.Name, cb))
 	}
 	return b.String()
 }
 
-func genListView(dw *model.DesignWidget) string {
+func genListView(dw *model.DesignWidget, p string) string {
 	cols := splitCSV(dw.GetProperty("Columns"))
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\t// ListView: %s (类 DataGridView 多列列表)\n", dw.Name))
-	b.WriteString(fmt.Sprintf("\t%sData := [][]string{}\n", dw.Name))
-	b.WriteString(fmt.Sprintf("\t%s := widget.NewTable(\n", dw.Name))
-	b.WriteString(fmt.Sprintf("\t\tfunc() (int, int) { return len(%sData), %d },\n", dw.Name, len(cols)))
+	b.WriteString(fmt.Sprintf("\t%s%sData = [][]string{}\n", p, dw.Name))
+	b.WriteString(fmt.Sprintf("\t%s%s = widget.NewTable(\n", p, dw.Name))
+	b.WriteString(fmt.Sprintf("\t\tfunc() (int, int) { return len(%s%sData), %d },\n", p, dw.Name, len(cols)))
 	b.WriteString("\t\tfunc() fyne.CanvasObject { return widget.NewLabel(\"\") },\n")
-	b.WriteString(fmt.Sprintf("\t\tfunc(id widget.TableCellID, obj fyne.CanvasObject) {\n\t\t\tif id.Row < len(%sData) { obj.(*widget.Label).SetText(%sData[id.Row][id.Col]) }\n\t\t},\n", dw.Name, dw.Name))
+	b.WriteString(fmt.Sprintf("\t\tfunc(id widget.TableCellID, obj fyne.CanvasObject) {\n\t\t\tif id.Row < len(%s%sData) { obj.(*widget.Label).SetText(%s%sData[id.Row][id.Col]) }\n\t\t},\n", p, dw.Name, p, dw.Name))
 	b.WriteString("\t)\n")
 	return b.String()
 }
 
-func genTreeView(dw *model.DesignWidget) string {
+func genTreeView(dw *model.DesignWidget, p string) string {
 	roots := splitCSV(dw.GetProperty("RootNodes"))
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("\t// TreeView: %s\n", dw.Name))
-	b.WriteString(fmt.Sprintf("\t%sData := map[string][]string{\n", dw.Name))
-	b.WriteString(fmt.Sprintf("\t\t\"\": {"))
+	b.WriteString(fmt.Sprintf("\t%s%sData = map[string][]string{\n", p, dw.Name))
+	b.WriteString("\t\t\"\": {")
 	rootStrs := make([]string, len(roots))
 	for i, r := range roots {
 		rootStrs[i] = fmt.Sprintf("%q", strings.TrimSpace(r))
@@ -758,27 +921,21 @@ func genTreeView(dw *model.DesignWidget) string {
 		b.WriteString(fmt.Sprintf("\t\t%q: {\"子节点1\", \"子节点2\"},\n", r))
 	}
 	b.WriteString("\t}\n")
-	b.WriteString(fmt.Sprintf("\t%s := widget.NewTree(\n", dw.Name))
-	b.WriteString(fmt.Sprintf("\t\tfunc(uid widget.TreeNodeID) []widget.TreeNodeID { return %sData[uid] },\n", dw.Name))
-	b.WriteString(fmt.Sprintf("\t\tfunc(uid widget.TreeNodeID) bool { _, ok := %sData[uid]; return ok },\n", dw.Name))
+	b.WriteString(fmt.Sprintf("\t%s%s = widget.NewTree(\n", p, dw.Name))
+	b.WriteString(fmt.Sprintf("\t\tfunc(uid widget.TreeNodeID) []widget.TreeNodeID { return %s%sData[uid] },\n", p, dw.Name))
+	b.WriteString(fmt.Sprintf("\t\tfunc(uid widget.TreeNodeID) bool { _, ok := %s%sData[uid]; return ok },\n", p, dw.Name))
 	b.WriteString("\t\tfunc(branch bool) fyne.CanvasObject { return widget.NewLabel(\"\") },\n")
 	b.WriteString("\t\tfunc(uid widget.TreeNodeID, branch bool, obj fyne.CanvasObject) { obj.(*widget.Label).SetText(uid) },\n")
 	b.WriteString("\t)\n")
 	for _, ev := range dw.EnabledEvents() {
-		switch ev.EventName {
-		case "NodeClick":
-			b.WriteString(fmt.Sprintf("\t%s.OnSelected = func(uid widget.TreeNodeID) { %s(string(uid)) }\n", dw.Name, ev.HandlerFn))
+		if ev.EventName == "NodeClick" {
+			b.WriteString(fmt.Sprintf("\t%s%s.OnSelected = func(uid widget.TreeNodeID) { f.%s(string(uid)) }\n", p, dw.Name, ev.HandlerFn))
 		}
 	}
 	return b.String()
 }
 
-func genStatusStrip(dw *model.DesignWidget) string {
-	text := dw.GetProperty("Text")
-	return fmt.Sprintf("\t%s := widget.NewLabel(%q) // StatusStrip\n", dw.Name, text)
-}
-
-func genPictureBox(dw *model.DesignWidget) string {
+func genPictureBox(dw *model.DesignWidget, p string) string {
 	path := dw.GetProperty("ImagePath")
 	sizeMode := dw.GetProperty("SizeMode")
 	fillMode := "canvas.ImageFillContain"
@@ -788,20 +945,27 @@ func genPictureBox(dw *model.DesignWidget) string {
 	case "Normal":
 		fillMode = "canvas.ImageFillOriginal"
 	}
+	var b strings.Builder
 	if path != "" {
-		return fmt.Sprintf("\t%s := canvas.NewImageFromFile(%q)\n\t%s.FillMode = %s\n", dw.Name, path, dw.Name, fillMode)
+		b.WriteString(fmt.Sprintf("\t%s%s = canvas.NewImageFromFile(%q)\n", p, dw.Name, path))
+	} else {
+		b.WriteString(fmt.Sprintf("\t%s%s = canvas.NewImageFromResource(nil)\n", p, dw.Name))
 	}
-	return fmt.Sprintf("\t%s := canvas.NewImageFromResource(nil) // PictureBox: 请设置图片资源\n\t%s.FillMode = %s\n", dw.Name, dw.Name, fillMode)
+	b.WriteString(fmt.Sprintf("\t%s%s.FillMode = %s\n", p, dw.Name, fillMode))
+	return b.String()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 辅助函数
 // ─────────────────────────────────────────────────────────────────────────────
 
-// findCallback 找到控件上已启用的指定事件回调，否则返回 "nil"
-func findCallback(dw *model.DesignWidget, eventName string) string {
+// cbRef 找到控件上已启用的指定事件回调引用；p 为前缀（"f." 或 ""）
+func cbRef(dw *model.DesignWidget, eventName string, p string) string {
 	for _, ev := range dw.EnabledEvents() {
 		if ev.EventName == eventName {
+			if p != "" {
+				return p + ev.HandlerFn
+			}
 			return ev.HandlerFn
 		}
 	}
